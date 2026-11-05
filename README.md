@@ -1,103 +1,187 @@
 # tc-wayland_compositor
 
 A Wayland compositor that runs entirely on a DiamondFire plot, written in
-[Terracotta](https://owlfroggy.github.io/terracotta-beta-docs/). The clients
-are Terracotta programs on the same plot. A resource pack's core text shader
-draws their buffers.
+[Terracotta](https://owlfroggy.github.io/terracotta-beta-docs/). Its clients
+are Terracotta programs on the same plot. They speak the real Wayland wire
+protocol (`wl_*` and `xdg-shell`, encoded as 32-bit words) to the compositor
+through an in-DF "kernel" that provides sockets, fd passing and shared
+memory. A resource pack's core text shader draws the windows.
 
-Status: render spike. It answers one question: how fast can DF put buffer
-pixels on screen?
+Nothing runs outside DF. Python scripts only generate tables and the pack at
+build time.
 
-## How pixels reach the screen
-
-Each 32-bit word of a client's buffer becomes one glyph of the font `wl:px`:
-
-- the text color holds the word's low 24 bits,
-- the glyph (one of 256 per format) holds the top byte.
-
-The text shader (`pack/assets/minecraft/shaders/core/text.fsh`,
-`pack/assets/wl/shaders/include/px.glsl`) reads both and paints the glyph's
-quad with the decoded pixels. DF only copies words into glyphs and does no
-per-pixel math.
-
-| Format | Pixels per glyph | Glyph size (font units) |
-| --- | --- | --- |
-| `argb8888` | 1 (alpha below 128 is cut out) | 10 × 10 |
-| `rgb332` | 4, the leftmost in the low byte | 40 × 10 |
-
-Each glyph's last texel column has alpha 0. The bitmap provider then gives
-the glyph an advance equal to its quad width, so glyphs tile with no gap. A
-text display's line height (10) equals the glyph height, so rows tile too.
-
-## Spike commands
+## Use
 
 | Command | Does |
 | --- | --- |
-| `@px still <argb\|332> <width> <height> [bands]` | Draws a test card once and prints how long it took. |
-| `@px start <argb\|332> <width> <height> [bands] [every]` | Loops an 8-frame animation, one frame every `every` ticks, and prints a `PXSPIKE` line every 5 seconds. |
-| `@px stop` | Removes the window. |
-| `@pack` | Sends the resource pack again. |
+| `@wl start` | Starts the compositor. The wall goes 7 blocks in front of you, facing you. |
+| `@wl info` | Runs **wayland-info**: prints the globals, shm formats, seat and output in chat. |
+| `@wl simple` | Runs **simple**: an argb8888 window with a bouncing square (like weston-simple-shm). |
+| `@wl paint` | Runs **paint**: an rgb332 canvas. Click to paint. Type `1`–`8` for a color, `p` to toggle the pen (paint as you look), `c` to clear. |
+| `@wl term` | Runs **term**: an rgb332 terminal with a small shell (`help`, `echo`, `ps`, `uptime`, `run <app>`, `clear`, `exit`). |
+| `@wl stop` | Stops the compositor and every app. |
+| `@wl stats` | Prints plot CPU, windows and connections. |
+| `@key <name>` | Types a special key: `enter`, `back`, `tab`, `esc`, `up`, `down`, `left`, `right`. |
+| `@wl look <x> <y>` | Turns you to look at wall pixel (x, y). This is for testing the pointer. |
+| `@wl test` | Runs the kernel and wire self-test (prints `WLTEST` lines). |
 
-A window is a stack of text displays ("bands"), one text line per pixel row,
-1/16 block per pixel. By default a band holds about 512 glyphs.
+Any app command starts the compositor if it isn't running.
 
-The test card has eight color bars on top. At the bottom left is a
-one-pixel checkerboard, which shows any gap or blur between glyphs. At the
-bottom right is a red checker with cut-out squares (argb8888 only).
+**Input:**
+- **Pointer:** your crosshair. Each tick the compositor casts your look ray
+  onto the wall, which gives `wl_pointer` enter, leave and motion.
+- **Clicks:** left and right click send button 272 and 273 (a press and a
+  release, since DF only reports clicks).
+- **Keyboard:** chat lines go to the focused window as `wl_keyboard` key
+  events, followed by Enter.
 
-A `PXSPIKE run` line reports frames per second (`fps`), the mean DF time per
-frame in milliseconds (`ms`, worst in brackets) and the mean plot CPU
-(`cpu`). Only DF's time is measured, not the client's.
+**Windows:**
+- Click a window to focus and raise it. The focused window's title bar is
+  blue.
+- Click a title bar to pick the window up, then click again to drop it.
+- The red box closes the window (`xdg_toplevel.close`).
 
-## Spike results
+## How it works
 
-Measured on 2026-11-04 on Plot 206003, with one player and every band
-rewritten each frame:
+```
+ app process (apps.tc)            compositor process (server.tc)
+ wlc.tc client library            dispatch -> objects, surfaces, xdg-shell
+        |    wire.tc words              |   wm.tc: wall, focus, pointer, keys
+        v                               v   render.tc: bands -> text displays
+ kernel.tc: k.q <c> c2s / s2c word queues, k.fdq fd queues, k.mem <fd> memfds
+```
 
-| Window | Glyphs | Every | fps | DF ms per frame (worst) | Building strings | Plot CPU |
-| --- | --- | --- | --- | --- | --- | --- |
-| argb8888 64×48 | 3,072 | 1 tick | 20 | 20–21 (46) | 6 ms | 70–86% |
-| rgb332 128×96 | 3,072 | 1 tick | 20 | 20 (35) | — | 73–82% |
-| argb8888 128×96 | 12,288 | 4 ticks | 5 | 83 (113) | — | 78–84% |
+- **Kernel** (`kernel.tc`). A connection is a pair of word queues, each with
+  an fd queue beside it (SCM_RIGHTS). A memfd is a global list of 32-bit
+  little-endian words. A client draws into its memfd, and the compositor
+  reads the same list, so pixels are never copied between processes.
+- **Wire** (`wire.tc`, `protocol.tc`). A message is `[object id, size << 16
+  | opcode, args...]`. Strings and arrays are their byte length, then the
+  bytes packed four to a word. `tools/protocol2tc.py` generates the message
+  signatures from `wayland.xml` and `xdg-shell.xml`.
+- **Compositor** (`server.tc`). It offers `wl_compositor` 4, `wl_shm` 1
+  (argb8888, xrgb8888, rgb332), `wl_seat` 1 (pointer and keyboard),
+  `wl_output` 1 and `xdg_wm_base` 1. Surfaces follow the usual
+  pending/commit model, and toplevels get the initial configure / ack
+  handshake. The keymap is format 0 (no_keymap): both ends use the US evdev
+  table in `keymap.tc`.
+- **Rendering** (`render.tc`, the pack). A window is a stack of text displays
+  ("bands"), one text line per pixel row, about 512 glyphs per band. Each
+  buffer word becomes one glyph of the font `wl:px`: the text color carries
+  the word's low 24 bits and the glyph carries the top byte. The core text
+  shader decodes them:
 
-- **Correct output:** both test cards are exact. The bars are in order, the
-  1-pixel checkerboard is crisp with no seams between bands, and argb8888
-  cut-out works.
-- **Cost:** about 6.7 µs of DF time per glyph, whatever the format, so
-  rgb332 gives 4 times the pixels for the same cost. Roughly 3,000 glyphs per
-  tick fills the plot's CPU.
+  | Format | Pixels per glyph |
+  | --- | --- |
+  | `argb8888` | 1 (alpha below 128 is cut out) |
+  | `xrgb8888` | 1 |
+  | `rgb332` | 4, the leftmost in the low byte |
+
+  A commit's damage marks bands. The compositor redraws at most about 1,500
+  glyphs per tick. A frame is presented when no marked bands are left: the
+  buffer is released and the frame callbacks run, which paces the clients.
+  Each glyph's last texel column is transparent, so the bitmap font's advance
+  equals the glyph width and pixels tile with no gaps.
+- **Decorations** (`wm.tc`). Title bars are small rgb332 memfds that the
+  compositor draws itself with the 8×8 font (`font.tc`, from Lat15-VGA8), and
+  renders like any window.
+
+## Measurements
+
+These were measured on Plot 206003 on 2026-11-04 with one player.
+
+The render spike (`@px`) rewrote every band each frame:
+
+| Window | Glyphs | Every | fps | DF ms per frame (worst) | Plot CPU |
+| --- | --- | --- | --- | --- | --- |
+| argb8888 64×48 | 3,072 | 1 tick | 20 | 20–21 (46) | 70–86% |
+| rgb332 128×96 | 3,072 | 1 tick | 20 | 20 (35) | 73–82% |
+| argb8888 128×96 | 12,288 | 4 ticks | 5 | 83 (113) | 78–84% |
+
+The compositor itself:
+
+| State | Plot CPU |
+| --- | --- |
+| no compositor | 0% |
+| `simple` animating | 41% |
+| `simple` animating, `paint` and `term` idle | 41% |
+
+- **Cost per glyph:** about 6.7 µs of DF time, whatever the format, so rgb332
+  gives four times the pixels for the same cost.
 - **Where the time goes:** about 30% builds the MiniMessage strings and about
-  70% parses them and sets the display text. The parse is the first thing to
-  cut.
-- **Tearing:** bands update on different client frames, so a moving image
-  can show two frames at once across a band boundary.
-- **DF bitwise:** the actions work on 32-bit signed ints, and the 64-bit
-  option (`^>>`, `^<<` and the rest) gives wrong results. Words reach 2^32,
-  so the top byte is split off with `%` and exact division.
+  70% parses them and sets the text.
+- **Damage tracking:** windows that don't change cost almost nothing.
+- **Tearing:** bands reach the client on different frames, so a moving
+  image can show two frames at once across a band boundary.
+
+## DiamondFire findings
+
+- **Bitwise:** DF's bitwise actions work on 32-bit signed ints, and the
+  64-bit option (`^>>`, `^<<` and the rest) gives wrong results. For example,
+  `0xFFFF0000 ^>>> 24` comes back unchanged. Words reach 2^32, so the code
+  splits off the top byte with `%` and exact division and keeps shifts below
+  2^31.
+- **Function arguments:** `f(argNum(...), argNum(...))` once gave a wrong
+  argument (height 0). Putting each call's result in its own variable first
+  fixed it.
+- **Mode switches:** a mode switch ends processes without running any
+  cleanup, so the compositor keeps a heartbeat (`s.beat`), and `@wl` restarts
+  it when the heartbeat is old.
+- **Line splitting:** long codelines (the generated `wlProtoInit`) need
+  `plotSize` in `.vscode/launch.json` (300 here). Without it, placing code
+  can stall.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `src/spike.tc` | Window spawn, test-pattern painter, frame drawing and timing |
-| `src/commands.tc` | Chat command dispatcher |
+| `src/kernel.tc` | Sockets, fd queues, memfds |
+| `src/wire.tc` | Wire format encode and decode |
+| `src/protocol.tc` | Generated message tables (`tools/protocol2tc.py`) |
+| `src/server.tc` | Compositor loop, request dispatch, surfaces, xdg-shell |
+| `src/wm.tc` | Wall, placement, title bars, focus, pointer, keyboard, dragging |
+| `src/render.tc` | Band rendering and presentation |
+| `src/wlc.tc` | Client library |
+| `src/apps.tc` | wayland-info, simple, paint, term |
+| `src/font.tc`, `src/font8.tc` | 8×8 text drawing; font rows generated by `tools/font2tc.py` |
+| `src/keymap.tc` | US evdev key table |
+| `src/events.tc` | Player clicks and chat as input |
+| `src/wl.tc`, `src/commands.tc` | `@wl`, `@key`, `@px`, `@pack` |
+| `src/tests.tc` | Self-test (`@wl test`) |
+| `src/spike.tc` | The original render spike (`@px`) |
+| `src/glyphs.tc` | Generated pixel-glyph and hex tables (`pack/src/px_assets.py`) |
 | `src/pack.tc` | Sends the pack on join |
-| `src/glyphs.tc` | Generated glyph and hex tables |
 | `src/cpu.tc` | `cpuYield`, from tc-neural_network |
 | `pack/` | Resource pack source (`pack/src/` holds generators and is not shipped) |
 | `tools/build_pack.py` | Validates, builds and publishes the pack |
+| `tools/deploy.sh` | Compiles, places the code and switches to play mode |
+| `tools/read_test.sh` | Prints the last `WLTEST` run from the client log |
 
-## Resource pack
+## Build
 
 ```sh
-python3 pack/src/px_assets.py                    # regenerate the font and src/glyphs.tc
-python3 tools/build_pack.py --check              # validate only
+python3 tools/protocol2tc.py                     # regenerate src/protocol.tc
+python3 tools/font2tc.py                         # regenerate src/font8.tc
+python3 pack/src/px_assets.py                    # regenerate the pixel font and src/glyphs.tc
+python3 tools/build_pack.py --check              # validate the pack
 python3 tools/build_pack.py --publish --push     # build, commit to pack-dist, push
+tools/deploy.sh                                  # place the code on the plot
 ```
 
 The shader check needs `glslc` and the Minecraft 26.3 client jar. After
 publishing, set the printed URL in `packUrl()` (`src/pack.tc`).
 
-This pack overrides `minecraft:core/text`, the same as the mech game's pack,
-and the spike defines the `command`, `join` and `resourcePackLoad` events. On
-a plot shared with the mech game, the last code and pack sent win.
+This pack overrides `minecraft:core/text`, the same as the mech game's pack.
+This project also defines the `command`, `join`, `resourcePackLoad`,
+`leftClick`, `rightClick` and `chat` events. On a plot shared with the mech
+game, the last code and pack sent win.
+
+## Limits
+
+- Only `wl_shm` buffers, toplevels and the interfaces above: no subsurfaces,
+  popups, dmabuf, data devices or touch.
+- A memfd holds at most 10,000 words (DF's list limit), so a window can be
+  at most about 96×96 in argb8888 or 192×192 in rgb332.
+- No key repeat and no held mouse buttons: DF reports clicks and chat lines,
+  not presses and releases.
+- One player drives the input: whoever ran `@wl start`.

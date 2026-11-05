@@ -1,0 +1,386 @@
+// server.tc: the compositor. One process (wlServer) accepts connections,
+// dispatches their requests, runs the window manager (wm.tc) and renders
+// windows (render.tc), once per tick.
+//
+// Per connection c:
+//   global "s.objs <c>"     dict: object id (as text) -> interface
+//   global "s.o <c> <id>"   dict: that object's state
+//   global "s.ptrs <c>", "s.kbds <c>"   its wl_pointer and wl_keyboard ids
+
+/** Run id: @wl start and @wl stop change it, which ends the old loop and its clients. */
+declare global "wl.alive": num;
+/** 1 while the compositor runs. */
+declare global "s.on": num;
+/** game.ticksSinceStartup at the compositor loop's last pass (wmActive checks it). */
+declare global "s.beat": num;
+declare global "s.conns": list[num];
+declare global "s.serial": num;
+declare global "s.objs %var(c)": dict;
+declare global "s.o %var(c) %var(id)": dict;
+declare global "s.ptrs %var(c)": list[num];
+declare global "s.kbds %var(c)": list[num];
+
+/** The globals the compositor offers: [name, interface, version]. */
+function wlsGlobals(): list {
+    return [[1, "wl_compositor", 4], [2, "wl_shm", 1], [3, "wl_seat", 1], [4, "wl_output", 1], [5, "xdg_wm_base", 1]];
+}
+
+/** wl_shm formats offered: argb8888, xrgb8888 and rgb332 ("RGB8"). */
+function wlsFormats(): list[num] {
+    return [0, 1, 943867730];
+}
+
+/** The next event serial. */
+function wlsSerial(): num {
+    global "s.serial" += 1;
+    return global "s.serial";
+}
+
+/** Milliseconds for event timestamps. */
+function wlsTime(): num {
+    return num.floor(game.microsecondsSinceStartup / 1000) % 4294967296;
+}
+
+/** Sends event `name` of iface on object obj to connection c. */
+function wlsSend(c: num, obj: num, iface: str, name: str, values: list) {
+    kSend(c, "s2c", wlEncode("ev", iface, obj, name, values), list.create() as list[num]);
+}
+
+/** Sends a protocol error on object obj. */
+function wlsError(c: num, obj: num, code: num, message: str) {
+    wlsSend(c, 1, "wl_display", "error", [obj, code, message]);
+}
+
+/** The interface of object id on c, or "" if there is none. */
+function wlsIface(c: num, id: num): str {
+    if (!var.exists(global "s.objs %var(c)")) {
+        return "";
+    }
+    if (global "s.objs %var(c)".hasKey("%var(id)")) {
+        return global "s.objs %var(c)"["%var(id)"] as str;
+    }
+    return "";
+}
+
+/** Creates object id on c. */
+function wlsAdd(c: num, id: num, iface: str, state: dict) {
+    global "s.objs %var(c)"["%var(id)"] = iface;
+    global "s.o %var(c) %var(id)" = state;
+}
+
+/** One field of object id's state. */
+function wlsGet(c: num, id: num, key: str): any {
+    return global "s.o %var(c) %var(id)"[key];
+}
+
+/** Sets one field of object id's state. */
+function wlsPut(c: num, id: num, key: str, value: any) {
+    global "s.o %var(c) %var(id)"[key] = value;
+}
+
+/** Forgets object id on c and tells the client it may reuse the id. */
+function wlsDestroy(c: num, id: num) {
+    global "s.objs %var(c)".remove("%var(id)");
+    var.purgeMatching("s.o %var(c) %var(id)", matchRequirement="Entire name");
+    wlsSend(c, 1, "wl_display", "delete_id", [id]);
+}
+
+/** The compositor loop: one pass per tick until the run ends. */
+process wlServer {
+    line run: num = global "wl.alive";
+    global "s.on" = 1;
+    while (global "wl.alive" == run) {
+        global "s.beat" = game.ticksSinceStartup;
+        wlsAccept();
+        line conns: list[num] = global "s.conns";
+        for (line c of conns) {
+            wlsDispatch(c as num);
+        }
+        wlsReap();
+        wmInput();
+        wmRender(1500);
+        wait;
+    }
+}
+
+/** Accepts every connection waiting in k.listen. */
+function wlsAccept {
+    if (!var.exists(global "k.listen") || global "k.listen".len() == 0) {
+        return;
+    }
+    for (line c of global "k.listen") {
+        line cn: num = c as num;
+        global "s.conns".append(cn);
+        line objs: dict = {};
+        objs["1"] = "wl_display";
+        global "s.objs %var(cn)" = objs;
+        global "s.ptrs %var(cn)" = list.create() as list[num];
+        global "s.kbds %var(cn)" = list.create() as list[num];
+    }
+    global "k.listen" = list.create() as list[num];
+}
+
+/** Frees connections whose client hung up: their windows close and their objects go. */
+function wlsReap {
+    if (!var.exists(global "k.closed") || global "k.closed".len() == 0) {
+        return;
+    }
+    line closed: list[num] = global "k.closed";
+    global "k.closed" = list.create() as list[num];
+    for (line c of closed) {
+        line cn: num = c as num;
+        if (global "s.conns".find(cn) > 0) {
+            wlsDropConn(cn);
+        }
+    }
+}
+
+/** Closes connection c's windows and frees everything it owned. */
+function wlsDropConn(c: num) {
+    line windows: list[str] = global "s.windows";
+    for (line key of windows) {
+        line parts: list = (key as str).split(":");
+        if (num.parse(parts[1] as str) == c) {
+            wmUnmap(c, num.parse(parts[2] as str));
+        }
+    }
+    if (var.exists(global "s.objs %var(c)")) {
+        for (line id, line iface of global "s.objs %var(c)") {
+            var.purgeMatching("s.o %var(c) %var(id)", matchRequirement="Entire name");
+        }
+    }
+    var.purgeMatching("s.objs %var(c)", "s.ptrs %var(c)", "s.kbds %var(c)", matchRequirement="Entire name");
+    global "s.conns".removeValue(c);
+    kFree(c);
+}
+
+/** Reads and handles every request waiting on connection c. */
+function wlsDispatch(c: num) {
+    line words: list[num] = kTake(c, "c2s");
+    if (words.len() == 0) {
+        return;
+    }
+    for (line fr of wlFrames(words)) {
+        line m: list = fr as list;
+        line obj: num = m[1] as num;
+        line iface: str = wlsIface(c, obj);
+        if (iface == "") {
+            wlsError(c, 1, 0, "invalid object %var(obj)");
+        } else {
+            line spec: str = wlSpec("req", iface, m[2] as num);
+            line name: str = spec.split(" ")[1] as str;
+            wlsRequest(c, obj, iface, name, wlDecode(spec, m[3] as list[num]));
+        }
+    }
+}
+
+/** Handles one request. */
+function wlsRequest(c: num, obj: num, iface: str, name: str, args: list) {
+    if (iface == "wl_surface") {
+        wlsSurface(c, obj, name, args);
+    } else if (iface == "wl_display") {
+        if (name == "sync") {
+            wlsSend(c, args[1] as num, "wl_callback", "done", [wlsSerial()]);
+            wlsSend(c, 1, "wl_display", "delete_id", [args[1]]);
+        } else if (name == "get_registry") {
+            wlsAdd(c, args[1] as num, "wl_registry", {});
+            for (line g of wlsGlobals()) {
+                line gl: list = g as list;
+                wlsSend(c, args[1] as num, "wl_registry", "global", [gl[1], gl[2], gl[3]]);
+            }
+        }
+    } else if (iface == "wl_registry") {
+        if (name == "bind") {
+            wlsBind(c, args[1] as num, args[2] as str, args[3] as num, args[4] as num);
+        }
+    } else if (iface == "wl_compositor") {
+        if (name == "create_surface") {
+            wlsAdd(c, args[1] as num, "wl_surface", wlsNewSurface());
+        } else if (name == "create_region") {
+            wlsAdd(c, args[1] as num, "wl_region", {});
+        }
+    } else if (iface == "wl_shm") {
+        if (name == "create_pool") {
+            wlsAdd(c, args[1] as num, "wl_shm_pool", {fd: kTakeFd(c, "c2s"), size: args[3]});
+        }
+    } else if (iface == "wl_shm_pool") {
+        if (name == "create_buffer") {
+            line format: num = args[6] as num;
+            if (wlsFormats().find(format) == 0) {
+                wlsError(c, obj, 0, "unsupported format %var(format)");
+            } else {
+                line fd: num = wlsGet(c, obj, "fd") as num;
+                wlsAdd(c, args[1] as num, "wl_buffer", {fd: fd, offset: args[2], width: args[3], height: args[4], stride: args[5], format: format});
+            }
+        } else if (name == "resize") {
+            wlsPut(c, obj, "size", args[1]);
+        } else if (name == "destroy") {
+            wlsDestroy(c, obj);
+        }
+    } else if (iface == "wl_seat") {
+        if (name == "get_pointer") {
+            wlsAdd(c, args[1] as num, "wl_pointer", {});
+            global "s.ptrs %var(c)".append(args[1] as num);
+        } else if (name == "get_keyboard") {
+            wlsAdd(c, args[1] as num, "wl_keyboard", {});
+            global "s.kbds %var(c)".append(args[1] as num);
+            // Format 0 is no_keymap: clients read raw evdev key codes (keymap.tc).
+            line fd: num = kMemCreate(4);
+            kSend(c, "s2c", wlEncode("ev", "wl_keyboard", args[1] as num, "keymap", [0, fd, 0]), [fd]);
+            wmKeyboardAdded(c, args[1] as num);
+        } else if (name == "get_touch") {
+            wlsAdd(c, args[1] as num, "wl_touch", {});
+        }
+    } else if (iface == "xdg_wm_base") {
+        if (name == "get_xdg_surface") {
+            wlsAdd(c, args[1] as num, "xdg_surface", {surface: args[2]});
+            wlsPut(c, args[2] as num, "xdg", args[1]);
+        } else if (name == "destroy") {
+            wlsDestroy(c, obj);
+        }
+    } else if (iface == "xdg_surface") {
+        line surf: num = wlsGet(c, obj, "surface") as num;
+        if (name == "get_toplevel") {
+            wlsAdd(c, args[1] as num, "xdg_toplevel", {surface: surf});
+            wlsPut(c, surf, "role", "toplevel");
+            wlsPut(c, surf, "top", args[1]);
+        } else if (name == "ack_configure") {
+            wlsPut(c, surf, "acked", 1);
+        } else if (name == "destroy") {
+            wlsDestroy(c, obj);
+        }
+    } else if (iface == "xdg_toplevel") {
+        line surf: num = wlsGet(c, obj, "surface") as num;
+        if (name == "set_title") {
+            wlsPut(c, surf, "title", args[1]);
+            wmTitleChanged(c, surf);
+        } else if (name == "set_app_id") {
+            wlsPut(c, surf, "appId", args[1]);
+        } else if (name == "move") {
+            wmBeginMove(c, surf);
+        } else if (name == "destroy") {
+            wmUnmap(c, surf);
+            wlsPut(c, surf, "role", "");
+            wlsDestroy(c, obj);
+        }
+    } else if (name == "destroy" || name == "release") {
+        // wl_region, wl_buffer, wl_pointer, wl_keyboard, wl_output: nothing else to free.
+        if (iface == "wl_pointer") {
+            global "s.ptrs %var(c)".removeValue(obj);
+        } else if (iface == "wl_keyboard") {
+            global "s.kbds %var(c)".removeValue(obj);
+        }
+        wlsDestroy(c, obj);
+    }
+}
+
+/** Creates object id for global `name`, and sends the events a new binding gets. */
+function wlsBind(c: num, name: num, iface: str, version: num, id: num) {
+    line found: str = "";
+    for (line g of wlsGlobals()) {
+        line gl: list = g as list;
+        if (gl[1] as num == name) {
+            found = gl[2] as str;
+        }
+    }
+    if (found != iface) {
+        wlsError(c, 1, 0, "bad global %var(name) %var(iface)");
+        return;
+    }
+    wlsAdd(c, id, iface, {version: version});
+    if (iface == "wl_shm") {
+        for (line f of wlsFormats()) {
+            wlsSend(c, id, "wl_shm", "format", [f]);
+        }
+    } else if (iface == "wl_seat") {
+        // pointer | keyboard
+        wlsSend(c, id, "wl_seat", "capabilities", [3]);
+    } else if (iface == "wl_output") {
+        wlsSend(c, id, "wl_output", "geometry", [0, 0, 400, 250, 0, "DiamondFire", "plot wall", 0]);
+        // current | preferred, 20 Hz (one frame per tick)
+        wlsSend(c, id, "wl_output", "mode", [3, wmWallWidth(), wmWallHeight(), 20000]);
+    }
+}
+
+/** State of a new wl_surface. p* fields are pending until commit. */
+function wlsNewSurface(): dict {
+    return {pBuf: -1, pDamage: list.create(), pFrames: list.create(), buf: 0, frames: list.create(), role: "", xdg: 0, top: 0, cfgSent: 0, acked: 0, mapped: 0, title: "", appId: ""};
+}
+
+/** Handles a wl_surface request. */
+function wlsSurface(c: num, id: num, name: str, args: list) {
+    if (name == "attach") {
+        wlsPut(c, id, "pBuf", args[1]);
+    } else if (name == "damage" || name == "damage_buffer") {
+        line d: list = wlsGet(c, id, "pDamage") as list;
+        d.append(args[1], args[2], args[3], args[4]);
+        wlsPut(c, id, "pDamage", d);
+    } else if (name == "frame") {
+        wlsAdd(c, args[1] as num, "wl_callback", {});
+        line f: list = wlsGet(c, id, "pFrames") as list;
+        f.append(args[1]);
+        wlsPut(c, id, "pFrames", f);
+    } else if (name == "commit") {
+        wlsCommit(c, id);
+    } else if (name == "destroy") {
+        wmUnmap(c, id);
+        wlsDestroy(c, id);
+    }
+}
+
+/** Applies a surface's pending state. */
+function wlsCommit(c: num, id: num) {
+    line st: dict = global "s.o %var(c) %var(id)";
+    if (st["pBuf"] as num != -1) {
+        st["buf"] = st["pBuf"];
+        st["pBuf"] = -1;
+    }
+    line frames: list = st["frames"] as list;
+    frames.appendList(st["pFrames"] as list);
+    st["frames"] = frames;
+    st["pFrames"] = list.create();
+    line damage: list = st["pDamage"] as list;
+    st["pDamage"] = list.create();
+    global "s.o %var(c) %var(id)" = st;
+    if (st["role"] as str != "toplevel") {
+        // Not shown: release the buffer and run frame callbacks now.
+        wlsPresented(c, id);
+        return;
+    }
+    if (st["cfgSent"] as num == 0) {
+        // The initial commit: the client picks its own size (0 x 0).
+        wlsPut(c, id, "cfgSent", 1);
+        wlsSend(c, st["top"] as num, "xdg_toplevel", "configure", [0, 0, list.create()]);
+        wlsSend(c, st["xdg"] as num, "xdg_surface", "configure", [wlsSerial()]);
+        return;
+    }
+    if (st["acked"] as num == 0) {
+        return;
+    }
+    if (st["buf"] as num > 0) {
+        wmShow(c, id, damage);
+    } else {
+        wmUnmap(c, id);
+        wlsPresented(c, id);
+    }
+}
+
+/** The surface's last commit is on screen: release its buffer and run its frame callbacks. */
+function wlsPresented(c: num, id: num) {
+    if (!var.exists(global "s.o %var(c) %var(id)")) {
+        return;
+    }
+    line buf: num = wlsGet(c, id, "buf") as num;
+    if (buf > 0 && wlsIface(c, buf) == "wl_buffer") {
+        wlsSend(c, buf, "wl_buffer", "release", list.create());
+    }
+    line frames: list = wlsGet(c, id, "frames") as list;
+    if (frames.len() > 0) {
+        line t: num = wlsTime();
+        for (line cb of frames) {
+            wlsSend(c, cb as num, "wl_callback", "done", [t]);
+            wlsDestroy(c, cb as num);
+        }
+        wlsPut(c, id, "frames", list.create());
+    }
+}

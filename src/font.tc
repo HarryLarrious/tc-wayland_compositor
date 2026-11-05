@@ -1,0 +1,65 @@
+// font.tc: draws 8x8 text (font8.tc) into rgb332 shared-memory images, the
+// way a client toolkit would. An image is file fd with `stride` words per
+// row; an rgb332 word is four pixels, the leftmost in the low byte. Text x
+// positions must be multiples of 4.
+
+declare global "font.rows": list[num];
+
+/** Loads the font rows, once. */
+function fontInit {
+    if (!var.exists(global "font.rows")) {
+        global "font.rows" = fontRows();
+    }
+}
+
+/** The 16 rgb332 words for every 4-pixel pattern (bit 3 is the leftmost pixel) in colors fg and bg. */
+function fontNibbles(fg: num, bg: num): list[num] {
+    line out: list[num] = list.create() as list[num];
+    repeat (line n to 16) {
+        line bits: num = n - 1;
+        line word: num = 0;
+        repeat (line k to 4) {
+            line lit: num = (bits >> (4 - k)) & 1;
+            if (lit == 1) {
+                word += fg * 256 ** (k - 1);
+            } else {
+                word += bg * 256 ** (k - 1);
+            }
+        }
+        out.append(word);
+    }
+    return out;
+}
+
+/** Fills words x0..x0 + w - 1 of rows y0..y0 + h - 1 (0-based) with `word`. */
+function memFill(fd: num, stride: num, x0: num, y0: num, w: num, h: num, word: num) {
+    repeat (line y to h) {
+        line base: num = (y0 + y - 1) * stride + x0;
+        repeat (line x to w) {
+            global "k.mem %var(fd)"[base + x] = word;
+        }
+    }
+}
+
+/** Draws character ch with its top-left at pixel (x, y), using a fontNibbles table. */
+function fontChar(fd: num, stride: num, x: num, y: num, ch: str, nib: list[num]) {
+    line code: num = global "wl.ascii".find(ch);
+    if (code < 1) {
+        code = 32;
+    }
+    line base: num = (code - 1) * 8;
+    line col: num = x / 4 + 1;
+    repeat (line r to 8) {
+        line bits: num = global "font.rows"[base + r] as num;
+        line idx: num = (y + r - 1) * stride + col;
+        global "k.mem %var(fd)"[idx] = nib[(bits >> 4) + 1];
+        global "k.mem %var(fd)"[idx + 1] = nib[(bits & 15) + 1];
+    }
+}
+
+/** Draws text from pixel (x, y), 8 pixels per character. */
+function fontText(fd: num, stride: num, x: num, y: num, text: str, nib: list[num]) {
+    repeat (line i to text.len()) {
+        fontChar(fd, stride, x + (i - 1) * 8, y, text.trim(i, i), nib);
+    }
+}

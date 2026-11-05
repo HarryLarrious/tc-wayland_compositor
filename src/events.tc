@@ -1,0 +1,22 @@
+// events.tc: player input for the compositor. Clicks become pointer
+// buttons; while a window has focus, chat lines are typed into it instead
+// of being sent.
+
+playerevent leftClick {
+    if (wmActive() == 1 && default.uuid == global "s.player") {
+        global "s.clicks".append(272);
+    }
+}
+
+playerevent rightClick {
+    if (wmActive() == 1 && default.uuid == global "s.player") {
+        global "s.clicks".append(273);
+    }
+}
+
+playerevent chat {
+    if (wmActive() == 1 && default.uuid == global "s.player" && global "s.focus" != "") {
+        event.cancel();
+        kbQueueLine(event.message);
+    }
+}

@@ -1,0 +1,228 @@
+// wlc.tc: a small libwayland-client for Terracotta apps. An app process
+// connects (wlcConnect), sends requests by name (wlcReq) and reads events
+// with wlcPoll: a list of [object id, interface, event name, args].
+// Pings, delete_id and registry globals are handled here as well as
+// returned.
+//
+// Per connection c:
+//   global "cl.objs <c>"      dict: object id (as text) -> interface
+//   global "cl.next <c>"      next free object id
+//   global "cl.globals <c>"   [name, interface, version] per wl_registry.global
+//   global "cl.backlog <c>"   events read during a roundtrip, returned by the next wlcPoll
+
+declare global "cl.objs %var(c)": dict;
+declare global "cl.next %var(c)": num;
+declare global "cl.globals %var(c)": list;
+declare global "cl.backlog %var(c)": list;
+declare global "cl.reg %var(c)": num;
+/** The frame callback of the connection's last wlcPresent. */
+declare global "cl.frame %var(c)": num;
+/** App name of each open connection, by connection number (as text); @wl ps and the terminal's ps read it. */
+declare global "k.names": dict;
+
+/** Connects to the compositor as app `name`, asks for the registry and returns the connection. */
+function wlcConnect(name: str): num {
+    wlInit();
+    kbInit();
+    line c: num = kConnect();
+    if (!var.exists(global "k.names")) {
+        global "k.names" = {};
+    }
+    global "k.names"["%var(c)"] = name;
+    line objs: dict = {};
+    objs["1"] = "wl_display";
+    global "cl.objs %var(c)" = objs;
+    global "cl.next %var(c)" = 2;
+    global "cl.globals %var(c)" = list.create();
+    global "cl.backlog %var(c)" = list.create();
+    line reg: num = wlcNew(c, "wl_registry");
+    global "cl.reg %var(c)" = reg;
+    wlcReq(c, 1, "get_registry", [reg]);
+    return c;
+}
+
+/** Hangs up and frees the connection's client state. */
+function wlcClose(c: num) {
+    kHangup(c);
+    if (var.exists(global "k.names")) {
+        global "k.names".remove("%var(c)");
+    }
+    var.purgeMatching("cl.objs %var(c)", "cl.next %var(c)", "cl.globals %var(c)", "cl.backlog %var(c)", "cl.reg %var(c)", "cl.frame %var(c)", matchRequirement="Entire name");
+}
+
+/** Allocates an id for a new object of interface iface. */
+function wlcNew(c: num, iface: str): num {
+    line id: num = global "cl.next %var(c)";
+    global "cl.next %var(c)" += 1;
+    global "cl.objs %var(c)"["%var(id)"] = iface;
+    return id;
+}
+
+/** Sends request `name` on object obj. */
+function wlcReq(c: num, obj: num, name: str, values: list) {
+    line iface: str = global "cl.objs %var(c)"["%var(obj)"] as str;
+    kSend(c, "c2s", wlEncode("req", iface, obj, name, values), list.create() as list[num]);
+}
+
+/** Sends request `name` on object obj with fds. */
+function wlcReqFd(c: num, obj: num, name: str, values: list, fds: list[num]) {
+    line iface: str = global "cl.objs %var(c)"["%var(obj)"] as str;
+    kSend(c, "c2s", wlEncode("req", iface, obj, name, values), fds);
+}
+
+/** Every event that has arrived: [object id, interface, name, args] each. */
+function wlcPoll(c: num): list {
+    line out: list = global "cl.backlog %var(c)";
+    global "cl.backlog %var(c)" = list.create();
+    line words: list[num] = kTake(c, "s2c");
+    if (words.len() == 0) {
+        return out;
+    }
+    for (line fr of wlFrames(words)) {
+        line m: list = fr as list;
+        line obj: num = m[1] as num;
+        line key: str = "%var(obj)";
+        if (global "cl.objs %var(c)".hasKey(key)) {
+            line iface: str = global "cl.objs %var(c)"[key] as str;
+            line spec: str = wlSpec("ev", iface, m[2] as num);
+            line name: str = spec.split(" ")[1] as str;
+            line args: list = wlDecode(spec, m[3] as list[num]);
+            if (iface == "wl_registry" && name == "global") {
+                global "cl.globals %var(c)".append([args[1], args[2], args[3]]);
+            } else if (iface == "wl_display" && name == "delete_id") {
+                line gone: num = args[1] as num;
+                global "cl.objs %var(c)".remove("%var(gone)");
+            } else if (iface == "wl_display" && name == "error") {
+                line eobj: num = args[1] as num;
+                line ecode: num = args[2] as num;
+                line emsg: str = args[3] as str;
+                allPlayers.sendMessage(s"<red>wayland error on object %var(eobj), code %var(ecode): %var(emsg)");
+            } else if (iface == "xdg_wm_base" && name == "ping") {
+                wlcReq(c, obj, "pong", [args[1]]);
+            } else if (iface == "wl_keyboard" && name == "keymap") {
+                args[2] = kTakeFd(c, "s2c");
+            }
+            out.append([obj, iface, name, args]);
+        }
+    }
+    return out;
+}
+
+/** Waits until the compositor has handled every request sent so far. Events read meanwhile stay queued for wlcPoll. */
+function wlcRoundtrip(c: num) {
+    line cb: num = wlcNew(c, "wl_callback");
+    wlcReq(c, 1, "sync", [cb]);
+    line keep: list = list.create();
+    line done: num = 0;
+    line waited: num = 0;
+    while (done == 0 && waited < 200) {
+        for (line ev of wlcPoll(c)) {
+            line e: list = ev as list;
+            if (e[1] as num == cb && e[3] as str == "done") {
+                done = 1;
+            } else {
+                keep.append(e);
+            }
+        }
+        if (done == 0) {
+            wait;
+            waited += 1;
+        }
+    }
+    line backlog: list = global "cl.backlog %var(c)";
+    keep.appendList(backlog);
+    global "cl.backlog %var(c)" = keep;
+}
+
+/** Binds the first global of interface iface (at most `version`); 0 if there is none. */
+function wlcBind(c: num, iface: str, version: num): num {
+    for (line g of global "cl.globals %var(c)") {
+        line gl: list = g as list;
+        if (gl[2] as str == iface) {
+            line id: num = wlcNew(c, iface);
+            wlcReq(c, global "cl.reg %var(c)", "bind", [gl[1], iface, num.min(version, gl[3] as num), id]);
+            return id;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Opens a toplevel window of w x h pixels in wl_shm format `format` and
+ * waits for its first configure. Returns its objects and buffer:
+ * {surface, xdg, top, buf, fd, stride (words per row), pointer, keyboard}.
+ */
+function wlcWindow(c: num, title: str, w: num, h: num, format: num): dict {
+    wlcRoundtrip(c);
+    line comp: num = wlcBind(c, "wl_compositor", 4);
+    line shm: num = wlcBind(c, "wl_shm", 1);
+    line wm: num = wlcBind(c, "xdg_wm_base", 1);
+    line seat: num = wlcBind(c, "wl_seat", 1);
+    line surf: num = wlcNew(c, "wl_surface");
+    wlcReq(c, comp, "create_surface", [surf]);
+    line xs: num = wlcNew(c, "xdg_surface");
+    wlcReq(c, wm, "get_xdg_surface", [xs, surf]);
+    line top: num = wlcNew(c, "xdg_toplevel");
+    wlcReq(c, xs, "get_toplevel", [top]);
+    wlcReq(c, top, "set_title", [title]);
+    wlcReq(c, top, "set_app_id", [title]);
+    wlcReq(c, surf, "commit", list.create());
+    // Shared memory: rgb332 rows are padded to whole words.
+    line stride: num = w * 4;
+    if (format == 943867730) {
+        stride = num.round(w / 4, mode="Ceiling") * 4;
+    }
+    line fd: num = kMemCreate(stride * h);
+    line pool: num = wlcNew(c, "wl_shm_pool");
+    wlcReqFd(c, shm, "create_pool", [pool, fd, stride * h], [fd]);
+    line buf: num = wlcNew(c, "wl_buffer");
+    wlcReq(c, pool, "create_buffer", [buf, 0, w, h, stride, format]);
+    line ptr: num = wlcNew(c, "wl_pointer");
+    wlcReq(c, seat, "get_pointer", [ptr]);
+    line kb: num = wlcNew(c, "wl_keyboard");
+    wlcReq(c, seat, "get_keyboard", [kb]);
+    // The first configure must be acked before the first buffer.
+    line keep: list = list.create();
+    line acked: num = 0;
+    line waited: num = 0;
+    while (acked == 0 && waited < 200) {
+        for (line ev of wlcPoll(c)) {
+            line e: list = ev as list;
+            if (e[1] as num == xs && e[3] as str == "configure") {
+                wlcReq(c, xs, "ack_configure", [(e[4] as list)[1]]);
+                acked = 1;
+            } else {
+                keep.append(e);
+            }
+        }
+        if (acked == 0) {
+            wait;
+            waited += 1;
+        }
+    }
+    global "cl.backlog %var(c)" = keep;
+    return {surface: surf, xdg: xs, top: top, buf: buf, fd: fd, stride: stride / 4, w: w, h: h, pointer: ptr, keyboard: kb};
+}
+
+/** Attaches the window's buffer with damage [x, y, w, h, ...], asks for a frame callback (cl.frame) and commits. */
+function wlcPresent(c: num, win: dict, damage: list) {
+    line surf: num = win["surface"] as num;
+    wlcReq(c, surf, "attach", [win["buf"], 0, 0]);
+    line i: num = 1;
+    while (i + 3 <= damage.len()) {
+        wlcReq(c, surf, "damage_buffer", [damage[i], damage[i + 1], damage[i + 2], damage[i + 3]]);
+        i += 4;
+    }
+    line cb: num = wlcNew(c, "wl_callback");
+    wlcReq(c, surf, "frame", [cb]);
+    wlcReq(c, surf, "commit", list.create());
+    global "cl.frame %var(c)" = cb;
+}
+
+/** 1 while the app should keep running: its run is current and its connection open. */
+function wlcAlive(c: num, run: num): num {
+    if (global "wl.alive" == run && kOpen(c) == 1) {
+        return 1;
+    }
+    return 0;
+}

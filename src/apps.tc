@@ -1,0 +1,382 @@
+// apps.tc: Wayland clients written in Terracotta. Each is a process that
+// talks to the compositor only through wlc.tc (and so the wire protocol).
+//   appInfo    prints the globals, like wayland-info
+//   appSimple  argb8888 window with a bouncing square, like weston-simple-shm
+//   appPaint   rgb332 canvas: click to paint, keys pick colors
+//   appTerm    rgb332 terminal with a tiny shell
+
+/** Processes still to start: app names, read by the next app process (one per start). */
+declare global "app.queue": list[str];
+
+/** Starts app `name` (info, simple, paint or term); returns 0 for an unknown name. */
+function appLaunch(name: str): num {
+    if (name == "info") {
+        start appInfo;
+    } else if (name == "simple") {
+        start appSimple;
+    } else if (name == "paint") {
+        start appPaint;
+    } else if (name == "term") {
+        start appTerm;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/** wayland-info: lists the compositor's globals, shm formats, seat and output. */
+process appInfo {
+    line c: num = wlcConnect("wayland-info");
+    wlcRoundtrip(c);
+    allPlayers.sendMessage(s"<gold>wayland-info</gold> <gray>(connection %var(c))");
+    for (line g of global "cl.globals %var(c)") {
+        line gl: list = g as list;
+        line gname: num = gl[1] as num;
+        line giface: str = gl[2] as str;
+        line gver: num = gl[3] as num;
+        allPlayers.sendMessage(s"<gray>interface: <white>'%var(giface)'</white>, version: <white>%var(gver)</white>, name: <white>%var(gname)");
+    }
+    line shm: num = wlcBind(c, "wl_shm", 1);
+    line seat: num = wlcBind(c, "wl_seat", 1);
+    line out: num = wlcBind(c, "wl_output", 1);
+    wlcRoundtrip(c);
+    for (line ev of wlcPoll(c)) {
+        line e: list = ev as list;
+        line a: list = e[4] as list;
+        line what: str = (e[2] as str) + "." + (e[3] as str);
+        if (what == "wl_shm.format") {
+            line f: num = a[1] as num;
+            line fname: str = "0x%var(f)";
+            if (f == 0) {
+                fname = "ARGB8888";
+            } else if (f == 1) {
+                fname = "XRGB8888";
+            } else if (f == 943867730) {
+                fname = "RGB332";
+            }
+            allPlayers.sendMessage(s"<gray>  wl_shm format: <white>%var(fname)");
+        } else if (what == "wl_seat.capabilities") {
+            line caps: num = a[1] as num;
+            allPlayers.sendMessage(s"<gray>  wl_seat capabilities: <white>%var(caps)</white> (pointer keyboard)");
+        } else if (what == "wl_output.geometry") {
+            line make: str = a[6] as str;
+            line model: str = a[7] as str;
+            line mmw: num = a[3] as num;
+            line mmh: num = a[4] as num;
+            allPlayers.sendMessage(s"<gray>  wl_output: <white>%var(make) %var(model)</white>, %var(mmw) x %var(mmh) mm");
+        } else if (what == "wl_output.mode") {
+            line mw: num = a[2] as num;
+            line mh: num = a[3] as num;
+            line hz: num = a[4] as num;
+            allPlayers.sendMessage(s"<gray>  wl_output mode: <white>%var(mw) x %var(mh)</white> @ %var(hz) mHz");
+        }
+    }
+    wlcClose(c);
+}
+
+/** Background pixel (x, y) of appSimple, as an argb8888 word. */
+function simpleBg(x: num, y: num): num {
+    line r: num = x * 4;
+    line g: num = y * 5;
+    line b: num = 128 + ((x ^ y) & 63);
+    return 4278190080 + (r << 16) + (g << 8) + b;
+}
+
+/** weston-simple-shm style: a gradient window with a bouncing square, redrawn on every frame callback. */
+process appSimple {
+    line run: num = global "wl.alive";
+    line c: num = wlcConnect("simple");
+    line w: num = 64;
+    line h: num = 48;
+    line win: dict = wlcWindow(c, "simple", w, h, 0);
+    line fd: num = win["fd"] as num;
+    line stride: num = win["stride"] as num;
+    repeat (line y to h) {
+        repeat (line x to w) {
+            global "k.mem %var(fd)"[(y - 1) * stride + x] = simpleBg(x - 1, y - 1);
+        }
+        cpuYield(30);
+    }
+    line sx: num = 4;
+    line sy: num = 4;
+    line vx: num = 2;
+    line vy: num = 1;
+    line size: num = 8;
+    wlcPresent(c, win, [0, 0, w, h]);
+    line ready: num = 0;
+    line quit: num = 0;
+    while (quit == 0 && wlcAlive(c, run) == 1) {
+        for (line ev of wlcPoll(c)) {
+            line e: list = ev as list;
+            if (e[3] as str == "done" && e[1] as num == global "cl.frame %var(c)") {
+                ready = 1;
+            } else if (e[3] as str == "close" && e[2] as str == "xdg_toplevel") {
+                quit = 1;
+            }
+        }
+        if (ready == 1 && quit == 0) {
+            ready = 0;
+            // Put the background back where the square was, then draw it one step on.
+            repeat (line yy to size) {
+                repeat (line xx to size) {
+                    line px: num = sx + xx - 1;
+                    line py: num = sy + yy - 1;
+                    global "k.mem %var(fd)"[py * stride + px + 1] = simpleBg(px, py);
+                }
+            }
+            line ox: num = sx;
+            line oy: num = sy;
+            sx += vx;
+            sy += vy;
+            if (sx < 0 || sx + size > w) {
+                vx = 0 - vx;
+                sx += 2 * vx;
+            }
+            if (sy < 0 || sy + size > h) {
+                vy = 0 - vy;
+                sy += 2 * vy;
+            }
+            repeat (line yy to size) {
+                repeat (line xx to size) {
+                    global "k.mem %var(fd)"[(sy + yy - 1) * stride + sx + xx] = 4294967295;
+                }
+            }
+            line dx: num = num.min(ox, sx);
+            line dy: num = num.min(oy, sy);
+            wlcPresent(c, win, [dx, dy, num.abs(sx - ox) + size, num.abs(sy - oy) + size]);
+        }
+        wait;
+    }
+    wlcClose(c);
+}
+
+/** Sets rgb332 pixel (x, y) of image fd (stride words per row) to color. */
+function px332(fd: num, stride: num, x: num, y: num, color: num) {
+    line idx: num = y * stride + num.floor(x / 4) + 1;
+    line k: num = x % 4;
+    line w: num = global "k.mem %var(fd)"[idx] as num;
+    global "k.mem %var(fd)"[idx] = w + (color - wlByte(w, k)) * 256 ** k;
+}
+
+/** Paint: left click paints a dot; keys 1-8 pick a color, p toggles the pen (paint as you look), c clears. */
+process appPaint {
+    line run: num = global "wl.alive";
+    line c: num = wlcConnect("paint");
+    line w: num = 96;
+    line h: num = 64;
+    line win: dict = wlcWindow(c, "paint", w, h, 943867730);
+    line fd: num = win["fd"] as num;
+    line stride: num = win["stride"] as num;
+    memFill(fd, stride, 0, 0, stride, h, 4294967295);
+    wlcPresent(c, win, [0, 0, w, h]);
+    // black, red, green, blue, yellow, magenta, cyan, white
+    line palette: list[num] = [0, 224, 28, 3, 252, 227, 31, 255];
+    line names: list[str] = ["black", "red", "green", "blue", "yellow", "magenta", "cyan", "white"];
+    line color: num = 224;
+    line pen: num = 0;
+    line mx: num = -1;
+    line my: num = -1;
+    line damage: list = list.create();
+    line quit: num = 0;
+    while (quit == 0 && wlcAlive(c, run) == 1) {
+        for (line ev of wlcPoll(c)) {
+            line e: list = ev as list;
+            line a: list = e[4] as list;
+            line what: str = (e[2] as str) + "." + (e[3] as str);
+            line dot: num = 0;
+            if (what == "wl_pointer.enter") {
+                mx = num.floor(a[3] as num);
+                my = num.floor(a[4] as num);
+            } else if (what == "wl_pointer.motion") {
+                mx = num.floor(a[2] as num);
+                my = num.floor(a[3] as num);
+                dot = pen;
+            } else if (what == "wl_pointer.leave") {
+                mx = -1;
+            } else if (what == "wl_pointer.button" && a[4] as num == 1) {
+                dot = 1;
+            } else if (what == "wl_keyboard.key" && a[4] as num == 1) {
+                line ch: str = kbChar(a[3] as num, 0);
+                if (ch == "c") {
+                    memFill(fd, stride, 0, 0, stride, h, 4294967295);
+                    damage = [0, 0, w, h];
+                } else if (ch == "p") {
+                    pen = 1 - pen;
+                } else if (ch != "" && "12345678".contains(ch)) {
+                    line n: num = num.parse(ch);
+                    color = palette[n] as num;
+                    line cname: str = names[n] as str;
+                    wlcReq(c, win["top"] as num, "set_title", ["paint: %var(cname)"]);
+                }
+            } else if (what == "xdg_toplevel.close") {
+                quit = 1;
+            }
+            if (dot == 1 && mx >= 0) {
+                // A 3 x 3 brush, clipped to the canvas.
+                repeat (line yy to 3) {
+                    repeat (line xx to 3) {
+                        line px: num = mx + xx - 2;
+                        line py: num = my + yy - 2;
+                        if (px >= 0 && px < w && py >= 0 && py < h) {
+                            px332(fd, stride, px, py, color);
+                        }
+                    }
+                }
+                damage.append(mx - 1, my - 1, 3, 3);
+            }
+        }
+        if (damage.len() > 0) {
+            wlcPresent(c, win, damage);
+            damage = list.create();
+        }
+        wait;
+    }
+    wlcClose(c);
+}
+
+/** Draws terminal row r (0-based) of text `line` (padded to 16 characters). */
+function termRow(fd: num, stride: num, r: num, text: str, nib: list[num]) {
+    line padded: str = text + "                ";
+    fontText(fd, stride, 0, r * 8, padded.trim(1, 16), nib);
+}
+
+/** A 16 x 12 character terminal with a tiny shell. */
+process appTerm {
+    line run: num = global "wl.alive";
+    fontInit();
+    line c: num = wlcConnect("term");
+    line w: num = 128;
+    line h: num = 96;
+    line win: dict = wlcWindow(c, "term", w, h, 943867730);
+    line fd: num = win["fd"] as num;
+    line stride: num = win["stride"] as num;
+    // Light grey (6, 6, 3) on black.
+    line nib: list[num] = fontNibbles(219, 0);
+    line rows: list[str] = ["tc-wayland term", "type help", ""];
+    line input: str = "";
+    line shift: num = 0;
+    line redraw: num = 1;
+    line quit: num = 0;
+    while (quit == 0 && wlcAlive(c, run) == 1) {
+        line typed: num = 0;
+        for (line ev of wlcPoll(c)) {
+            line e: list = ev as list;
+            line a: list = e[4] as list;
+            line what: str = (e[2] as str) + "." + (e[3] as str);
+            if (what == "wl_keyboard.modifiers") {
+                shift = (a[2] as num) & 1;
+            } else if (what == "wl_keyboard.key" && a[4] as num == 1) {
+                line code: num = a[3] as num;
+                if (code == 28) {
+                    rows.append("$ %var(input)");
+                    line out: list[str] = termRun(c, input);
+                    if (out.len() == 1 && out[1] as str == "#clear#") {
+                        rows = list.create() as list[str];
+                    } else if (out.len() == 1 && out[1] as str == "#quit#") {
+                        quit = 1;
+                    } else {
+                        rows.appendList(out);
+                    }
+                    input = "";
+                    redraw = 1;
+                } else if (code == 14) {
+                    if (input.len() > 0) {
+                        input = input.trim(1, input.len() - 1);
+                    }
+                    typed = 1;
+                } else {
+                    line ch: str = kbChar(code, shift);
+                    if (ch != "" && input.len() < 40) {
+                        input = input + ch;
+                        typed = 1;
+                    }
+                }
+            } else if (what == "xdg_toplevel.close") {
+                quit = 1;
+            }
+        }
+        if (redraw == 1 || typed == 1) {
+            // Wrap the prompt line at 16 characters and keep the last 12 rows on screen.
+            line screen: list[str] = rows;
+            line prompt: str = "$ %var(input)_";
+            while (prompt.len() > 16) {
+                screen.append(prompt.trim(1, 16));
+                prompt = prompt.trim(17, prompt.len());
+            }
+            screen.append(prompt);
+            while (screen.len() > 12) {
+                screen.remove(1);
+            }
+            while (rows.len() > 11) {
+                rows.remove(1);
+            }
+            if (redraw == 1) {
+                repeat (line r to 12) {
+                    line text: str = "";
+                    if (r <= screen.len()) {
+                        text = screen[r] as str;
+                    }
+                    termRow(fd, stride, r - 1, text, nib);
+                    cpuYield(30);
+                }
+                wlcPresent(c, win, [0, 0, w, h]);
+            } else {
+                // Only the prompt rows changed.
+                line n: num = screen.len();
+                termRow(fd, stride, n - 1, screen[n] as str, nib);
+                if (n >= 2) {
+                    termRow(fd, stride, n - 2, screen[n - 1] as str, nib);
+                }
+                wlcPresent(c, win, [0, (num.max(1, n - 1) - 1) * 8, w, 16]);
+            }
+            redraw = 0;
+        }
+        wait;
+    }
+    wlcClose(c);
+}
+
+/** Runs one shell line; returns output rows. ["#clear#"] clears the screen, ["#quit#"] closes the terminal. */
+function termRun(c: num, input: str): list[str] {
+    line words: list[str] = input.split(" ");
+    line cmd: str = "";
+    if (words.len() > 0) {
+        cmd = words[1] as str;
+    }
+    if (cmd == "") {
+        return list.create() as list[str];
+    } else if (cmd == "help") {
+        return ["help clear exit", "echo ps uptime", "run info|simple", "    paint|term"];
+    } else if (cmd == "clear") {
+        return ["#clear#"];
+    } else if (cmd == "exit") {
+        return ["#quit#"];
+    } else if (cmd == "echo") {
+        line text: str = input.trim(6, input.len());
+        if (input.len() < 6) {
+            text = "";
+        }
+        return [text];
+    } else if (cmd == "uptime") {
+        line t: num = game.ticksSinceStartup;
+        return ["%var(t) ticks"];
+    } else if (cmd == "ps") {
+        line out: list[str] = ["conn app"];
+        for (line k, line v of global "k.names") {
+            line conn: str = k as str;
+            if (kOpen(num.parse(conn)) == 1) {
+                out.append("%var(conn)    %var(v)");
+            }
+        }
+        return out;
+    } else if (cmd == "run") {
+        if (words.len() >= 2) {
+            line app: str = words[2] as str;
+            if (appLaunch(app) == 1) {
+                return ["started %var(app)"];
+            }
+        }
+        return ["run what?"];
+    }
+    return ["%var(cmd): not found"];
+}

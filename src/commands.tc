@@ -52,6 +52,10 @@ playerevent command {
             default.sendMessage(s"<yellow>@px still <argb|332> <width> <height> [bands]</yellow> <gray>test card, drawn once and timed");
             default.sendMessage(s"<yellow>@px stop</yellow> <gray>removes the window");
         }
+    } else if (cmd == "wl") {
+        wlCommand(parts);
+    } else if (cmd == "key") {
+        keyCommand(parts);
     } else if (cmd == "pack") {
         packSend();
     }

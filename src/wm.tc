@@ -1,0 +1,551 @@
+// wm.tc: the window manager. Windows hang on a wall in front of the player
+// who ran @wl start: global "s.wall" holds its top-left corner (o), its right
+// direction (r) and its normal toward the player (n). Wall pixels are 1/16
+// block, x right and y down from the corner. Each window has a title bar
+// (decoration) 10 pixels tall above it, drawn by the compositor.
+//
+// The player's crosshair is the pointer: each tick wmInput casts the look
+// ray onto the wall. Left and right clicks are buttons; chat lines are typed
+// into the focused window (keymap.tc).
+
+/** Window keys "<c>:<surface id>", bottom to top. */
+declare global "s.windows": list[str];
+/** The wall frame: {o: loc, r: vec, n: vec}. */
+declare global "s.wall": dict;
+/** UUID of the player whose look and clicks drive the pointer. */
+declare global "s.player": str;
+/** Pointer state: over (window key or ""), sx, sy (surface position), px, py (wall), drag, ddx, ddy. */
+declare global "s.ptr": dict;
+/** Window key with keyboard focus, or "". */
+declare global "s.focus": str;
+/** Buttons clicked since the last tick (evdev codes). */
+declare global "s.clicks": list[num];
+/** Keys typed since the last tick: [code, shift] pairs. */
+declare global "s.keys": list;
+/** Windows mapped so far (places the next one). */
+declare global "s.placed": num;
+
+/** Title bar height in pixels. */
+function wmDecoH(): num {
+    return 10;
+}
+
+/** Wall size in pixels (reported as the output's mode). */
+function wmWallWidth(): num {
+    return 320;
+}
+
+function wmWallHeight(): num {
+    return 192;
+}
+
+/** Starts the compositor with the wall 7 blocks in front of the player. */
+function wmStart {
+    wlInit();
+    kbInit();
+    fontInit();
+    pxInit();
+    wmStop();
+    line forward: vec = default.direction;
+    forward.y = 0;
+    if (forward.len() < 0.1) {
+        forward = vec(0, 0, 1);
+    }
+    forward = forward.setLength(1);
+    line right: vec = vec(0 - forward.z, 0, forward.x);
+    line centre: loc = default.eyeLocation + forward * 7;
+    line corner: loc = centre + right * (0 - wmWallWidth() / 32) + vec(0, wmWallHeight() / 32, 0);
+    global "s.wall" = {o: corner, r: right, n: forward * -1};
+    global "s.player" = default.uuid;
+    global "s.ptr" = {over: "", sx: 0, sy: 0, px: -1, py: -1, drag: "", ddx: 0, ddy: 0};
+    global "s.focus" = "";
+    global "s.clicks" = list.create() as list[num];
+    global "s.keys" = list.create();
+    global "s.windows" = list.create() as list[str];
+    global "s.conns" = list.create() as list[num];
+    global "s.placed" = 0;
+    global "k.listen" = list.create() as list[num];
+    global "k.closed" = list.create() as list[num];
+    start wlServer;
+}
+
+/** Stops the compositor and every client, and removes every window. */
+function wmStop {
+    global "wl.alive" += 1;
+    global "s.on" = 0;
+    if (var.exists(global "s.windows")) {
+        line windows: list[str] = global "s.windows";
+        for (line key of windows) {
+            line parts: list = (key as str).split(":");
+            wmRemoveDisplays(num.parse(parts[1] as str), num.parse(parts[2] as str));
+        }
+    }
+    global "s.windows" = list.create() as list[str];
+}
+
+/** 1 while the compositor runs. A mode switch ends processes without running @wl stop, so the loop's heartbeat decides. */
+function wmActive(): num {
+    if (var.exists(global "s.on") && global "s.on" == 1 && var.exists(global "s.beat") && game.ticksSinceStartup - global "s.beat" < 40) {
+        return 1;
+    }
+    return 0;
+}
+
+/** World location of wall pixel (x, y), pushed `lift` blocks toward the player and facing them. */
+function wmWallLoc(x: num, y: num, lift: num): loc {
+    line wall: dict = global "s.wall";
+    line n: vec = wall["n"] as vec;
+    line p: loc = (wall["o"] as loc) + (wall["r"] as vec) * (x / 16) + vec(0, 0 - y / 16, 0) + n * lift;
+    return p.setDirection(n);
+}
+
+/** Shows (maps or updates) surface id of c with its committed buffer; damage is [x, y, w, h, ...]. */
+function wmShow(c: num, id: num, damage: list) {
+    line buf: num = wlsGet(c, id, "buf") as num;
+    line b: dict = global "s.o %var(c) %var(buf)" as dict;
+    line w: num = b["width"] as num;
+    line h: num = b["height"] as num;
+    line format: num = b["format"] as num;
+    line st: dict = global "s.o %var(c) %var(id)";
+    line key: str = "%var(c):%var(id)";
+    line fresh: num = 0;
+    if (st["mapped"] as num == 0 || st["w"] as num != w || st["h"] as num != h || st["format"] as num != format) {
+        if (st["mapped"] as num == 1) {
+            wmRemoveDisplays(c, id);
+        } else {
+            // A new window: cascade it across the wall and give it focus.
+            st["wx"] = 16 + (global "s.placed" * 24) % 160;
+            st["wy"] = 16 + (global "s.placed" * 16) % 96;
+            global "s.placed" += 1;
+            global "s.windows".append(key);
+        }
+        st["mapped"] = 1;
+        st["w"] = w;
+        st["h"] = h;
+        st["format"] = format;
+        line perWord: num = 1;
+        if (format == 943867730) {
+            perWord = 4;
+        }
+        line cols: num = num.round(w / perWord, mode="Ceiling");
+        st["cols"] = cols;
+        st["perWord"] = perWord;
+        st["bandRows"] = num.max(1, num.floor(512 / cols));
+        st["bands"] = num.round(h / (st["bandRows"] as num), mode="Ceiling");
+        st["decoCols"] = num.round(w / 4, mode="Ceiling");
+        global "s.o %var(c) %var(id)" = st;
+        wmCreateDisplays(c, id);
+        fresh = 1;
+    }
+    // Damaged rows mark their bands for rendering.
+    line dirty: list[num] = list.create() as list[num];
+    if (var.exists(global "s.o %var(c) %var(id)") && (global "s.o %var(c) %var(id)").hasKey("dirty")) {
+        dirty = wlsGet(c, id, "dirty") as list[num];
+    }
+    line bandRows: num = wlsGet(c, id, "bandRows") as num;
+    line bands: num = wlsGet(c, id, "bands") as num;
+    if (fresh == 1) {
+        damage = [0, 0, w, h];
+    }
+    line i: num = 1;
+    while (i + 3 <= damage.len()) {
+        line y0: num = num.max(0, damage[i + 1] as num);
+        line y1: num = num.min(h - 1, (damage[i + 1] as num) + (damage[i + 3] as num) - 1);
+        if (y1 >= y0) {
+            repeat (line band to bands) {
+                line top: num = (band - 1) * bandRows;
+                if (top <= y1 && top + bandRows - 1 >= y0 && dirty.find(band) == 0) {
+                    dirty.append(band);
+                }
+            }
+        }
+        i += 4;
+    }
+    wlsPut(c, id, "dirty", dirty);
+    wlsPut(c, id, "present", 1);
+    if (fresh == 1) {
+        wmFocus(key);
+    }
+}
+
+/** Spawns the band displays and the title bar of window id of c, facing the player. */
+function wmCreateDisplays(c: num, id: num) {
+    line st: dict = global "s.o %var(c) %var(id)";
+    line cols: num = st["cols"] as num;
+    line w: num = st["w"] as num;
+    line bandRows: num = st["bandRows"] as num;
+    line uuids: list[str] = list.create() as list[str];
+    repeat (line b to st["bands"] as num) {
+        game.spawnTextDisplay(wmWallLoc(0, 0, 0), s" ");
+        wmSetupDisplay(cols * 10 * (st["perWord"] as num) + 10, w, bandRows);
+        uuids.append(lastEntity.uuid);
+    }
+    game.spawnTextDisplay(wmWallLoc(0, 0, 0), s" ");
+    wmSetupDisplay((st["decoCols"] as num) * 40 + 10, w, wmDecoH());
+    wlsPut(c, id, "displays", uuids);
+    wlsPut(c, id, "deco", lastEntity.uuid);
+    // The title bar is a small rgb332 buffer the compositor draws itself.
+    line decoFd: num = kMemCreate((st["decoCols"] as num) * 4 * wmDecoH());
+    wlsPut(c, id, "decoFd", decoFd);
+    wmDrawDeco(c, id);
+    wmPlace(c, id);
+}
+
+/** Sets up the display just spawned (lastEntity) as a pixel band. */
+function wmSetupDisplay(lineWidth: num, w: num, rows: num) {
+    lastEntity.setDisplayBillboard(type="Fixed");
+    lastEntity.setDisplayScale(0.25, 0.25, 0.25);
+    lastEntity.setTextDisplayLineWidth(lineWidth);
+    lastEntity.setTextDisplayTextAlignment(align="Left");
+    lastEntity.setTextDisplayBackground("#000000", 0);
+    lastEntity.setTextDisplayTextShadow(textShadow="Disable");
+    lastEntity.setDisplayCullingSize(w / 16 + 1, rows / 16 + 1);
+}
+
+/** Moves window id's displays to its wall position and stacking depth. */
+function wmPlace(c: num, id: num) {
+    line st: dict = global "s.o %var(c) %var(id)";
+    line key: str = "%var(c):%var(id)";
+    // Each step up the stack sits 0.02 blocks nearer the player.
+    line lift: num = global "s.windows".find(key) * 0.02;
+    line wx: num = st["wx"] as num;
+    line wy: num = st["wy"] as num;
+    line h: num = st["h"] as num;
+    line bandRows: num = st["bandRows"] as num;
+    // A display's text is centred on its origin and sits above it.
+    line xc: num = wx + (st["cols"] as num) * (st["perWord"] as num) / 2;
+    line uuids: list[str] = st["displays"] as list[str];
+    repeat (line b to uuids.len()) {
+        line bottom: num = num.min(b * bandRows, h);
+        select entitiesByUUID(uuids[b] as str);
+        selectedEntity.teleport(wmWallLoc(xc, wy + bottom, lift));
+        select reset;
+    }
+    select entitiesByUUID(st["deco"] as str);
+    selectedEntity.teleport(wmWallLoc(wx + (st["decoCols"] as num) * 2, wy, lift));
+    select reset;
+}
+
+/** Re-places every window (after the stacking order changes). */
+function wmPlaceAll {
+    line windows: list[str] = global "s.windows";
+    for (line key of windows) {
+        line parts: list = (key as str).split(":");
+        wmPlace(num.parse(parts[1] as str), num.parse(parts[2] as str));
+    }
+}
+
+/** Removes window id's displays and title bar buffer (it stays in s.windows). */
+function wmRemoveDisplays(c: num, id: num) {
+    if (!var.exists(global "s.o %var(c) %var(id)")) {
+        return;
+    }
+    line st: dict = global "s.o %var(c) %var(id)";
+    if (!st.hasKey("displays")) {
+        return;
+    }
+    for (line uid of st["displays"] as list[str]) {
+        select entitiesByUUID(uid as str);
+        selectedEntity.remove();
+        select reset;
+    }
+    select entitiesByUUID(st["deco"] as str);
+    selectedEntity.remove();
+    select reset;
+    kMemFree(st["decoFd"] as num);
+    st.remove("displays");
+    global "s.o %var(c) %var(id)" = st;
+}
+
+/** Unmaps window id of c: its displays go and it leaves the stack. */
+function wmUnmap(c: num, id: num) {
+    if (!var.exists(global "s.o %var(c) %var(id)") || wlsGet(c, id, "mapped") as num == 0) {
+        return;
+    }
+    wmRemoveDisplays(c, id);
+    wlsPut(c, id, "mapped", 0);
+    wlsPut(c, id, "dirty", list.create());
+    line key: str = "%var(c):%var(id)";
+    global "s.windows".removeValue(key);
+    if (global "s.ptr"["over"] as str == key) {
+        global "s.ptr"["over"] = "";
+    }
+    if (global "s.ptr"["drag"] as str == key) {
+        global "s.ptr"["drag"] = "";
+    }
+    if (global "s.focus" == key) {
+        global "s.focus" = "";
+        // Focus falls to the window below, if any.
+        if (global "s.windows".len() > 0) {
+            wmFocus(global "s.windows"[global "s.windows".len()] as str);
+        }
+    }
+    wmPlaceAll();
+}
+
+/** Draws window id's title bar: its title, and a close box on the right. Focused bars are blue. */
+function wmDrawDeco(c: num, id: num) {
+    line st: dict = global "s.o %var(c) %var(id)";
+    line fd: num = st["decoFd"] as num;
+    line cols: num = st["decoCols"] as num;
+    line key: str = "%var(c):%var(id)";
+    // rgb332: blue (0, 2, 3) when focused, grey (2, 2, 1) when not.
+    line bg: num = 73;
+    if (global "s.focus" == key) {
+        bg = 11;
+    }
+    line fill: num = bg * 16843009;
+    memFill(fd, cols, 0, 0, cols, wmDecoH(), fill);
+    line title: str = st["title"] as str;
+    if (title == "") {
+        title = "window";
+    }
+    line maxChars: num = num.floor((cols * 4 - 16) / 8);
+    fontText(fd, cols, 4, 1, title.trim(1, num.max(1, maxChars)), fontNibbles(255, bg));
+    // Close box: a white x on red (7, 1, 0), 8 pixels, at the right end.
+    memFill(fd, cols, cols - 3, 0, 2, wmDecoH(), 228 * 16843009);
+    fontChar(fd, cols, (cols - 3) * 4, 1, "x", fontNibbles(255, 228));
+    wlsPut(c, id, "decoDirty", 1);
+}
+
+/** The title changed: redraw the title bar of a mapped window. */
+function wmTitleChanged(c: num, id: num) {
+    if (wlsGet(c, id, "mapped") as num == 1) {
+        wmDrawDeco(c, id);
+    }
+}
+
+/** Gives keyboard focus to window key and raises it to the top. */
+function wmFocus(key: str) {
+    line old: str = global "s.focus";
+    if (global "s.windows".find(key) > 0 && global "s.windows"[global "s.windows".len()] as str != key) {
+        global "s.windows".removeValue(key);
+        global "s.windows".append(key);
+        wmPlaceAll();
+    }
+    if (old == key) {
+        return;
+    }
+    global "s.focus" = key;
+    if (old != "") {
+        line op: list = old.split(":");
+        line oc: num = num.parse(op[1] as str);
+        line oid: num = num.parse(op[2] as str);
+        if (var.exists(global "s.kbds %var(oc)")) {
+            for (line kb of global "s.kbds %var(oc)" as list) {
+                wlsSend(oc, kb as num, "wl_keyboard", "leave", [wlsSerial(), oid]);
+            }
+        }
+        if (var.exists(global "s.o %var(oc) %var(oid)") && wlsGet(oc, oid, "mapped") as num == 1) {
+            wmDrawDeco(oc, oid);
+        }
+    }
+    if (key != "") {
+        line np: list = key.split(":");
+        line nc: num = num.parse(np[1] as str);
+        line nid: num = num.parse(np[2] as str);
+        for (line kb of global "s.kbds %var(nc)" as list) {
+            wlsSend(nc, kb as num, "wl_keyboard", "enter", [wlsSerial(), nid, list.create()]);
+        }
+        wmDrawDeco(nc, nid);
+    }
+}
+
+/** A client got a keyboard after its window took focus: tell it now. */
+function wmKeyboardAdded(c: num, kb: num) {
+    line key: str = global "s.focus";
+    if (key != "") {
+        line p: list = key.split(":");
+        if (num.parse(p[1] as str) == c) {
+            wlsSend(c, kb, "wl_keyboard", "enter", [wlsSerial(), num.parse(p[2] as str), list.create()]);
+        }
+    }
+}
+
+/** xdg_toplevel.move: the window follows the pointer until the next click. */
+function wmBeginMove(c: num, id: num) {
+    line key: str = "%var(c):%var(id)";
+    if (global "s.ptr"["over"] as str == key) {
+        global "s.ptr"["drag"] = key;
+        global "s.ptr"["ddx"] = global "s.ptr"["sx"];
+        global "s.ptr"["ddy"] = global "s.ptr"["sy"];
+    }
+}
+
+/** Where the input player's look ray meets the wall, as [x, y] in wall pixels; [] when looking away. */
+function wmLookPoint(): list[num] {
+    select playersByName(global "s.player");
+    line eye: loc = selected.eyeLocation;
+    line dir: vec = selected.direction;
+    select reset;
+    line wall: dict = global "s.wall";
+    line n: vec = wall["n"] as vec;
+    line o: loc = wall["o"] as loc;
+    line denom: num = dir.dot(n);
+    if (denom > -0.05) {
+        return list.create() as list[num];
+    }
+    line toWall: vec = vec(o.x - eye.x, o.y - eye.y, o.z - eye.z);
+    line t: num = toWall.dot(n) / denom;
+    // Hit point relative to the wall corner.
+    line rel: vec = dir * t - toWall;
+    return [rel.dot(wall["r"] as vec) * 16, 0 - rel.y * 16];
+}
+
+/**
+ * What wall pixel (x, y) is on, topmost first: [window key, part, surface x, surface y].
+ * part is "body", "title" or "close"; the key is "" over empty wall.
+ */
+function wmHit(x: num, y: num): list {
+    line windows: list[str] = global "s.windows";
+    line i: num = windows.len();
+    while (i >= 1) {
+        line key: str = windows[i] as str;
+        line p: list = key.split(":");
+        line hc: num = num.parse(p[1] as str);
+        line hid: num = num.parse(p[2] as str);
+        line st: dict = global "s.o %var(hc) %var(hid)" as dict;
+        line wx: num = st["wx"] as num;
+        line wy: num = st["wy"] as num;
+        line decoW: num = (st["decoCols"] as num) * 4;
+        if (x >= wx && x < wx + (st["w"] as num) && y >= wy && y < wy + (st["h"] as num)) {
+            return [key, "body", x - wx, y - wy];
+        }
+        if (x >= wx && x < wx + decoW && y >= wy - wmDecoH() && y < wy) {
+            if (x >= wx + decoW - 12) {
+                return [key, "close", 0, 0];
+            }
+            return [key, "title", x - wx, y - wy];
+        }
+        i -= 1;
+    }
+    return ["", "", 0, 0];
+}
+
+/** Sends a pointer event to every wl_pointer of window key's client. */
+function wmPointerEvent(key: str, name: str, values: list) {
+    line p: list = key.split(":");
+    line c: num = num.parse(p[1] as str);
+    if (!var.exists(global "s.ptrs %var(c)")) {
+        return;
+    }
+    for (line ptr of global "s.ptrs %var(c)") {
+        wlsSend(c, ptr as num, "wl_pointer", name, values);
+    }
+}
+
+/** One tick of input: pointer motion, enter and leave, drags, clicks and keys. */
+function wmInput {
+    line ptr: dict = global "s.ptr";
+    line look: list[num] = wmLookPoint();
+    line x: num = -1000;
+    line y: num = -1000;
+    if (look.len() == 2) {
+        x = num.floor(look[1] as num);
+        y = num.floor(look[2] as num);
+    }
+    line moved: num = 0;
+    if (x != ptr["px"] as num || y != ptr["py"] as num) {
+        moved = 1;
+    }
+    ptr["px"] = x;
+    ptr["py"] = y;
+    line drag: str = ptr["drag"] as str;
+    if (drag != "" && moved == 1) {
+        line dp: list = drag.split(":");
+        line dc: num = num.parse(dp[1] as str);
+        line did: num = num.parse(dp[2] as str);
+        wlsPut(dc, did, "wx", x - (ptr["ddx"] as num));
+        wlsPut(dc, did, "wy", y - (ptr["ddy"] as num));
+        wmPlace(dc, did);
+    }
+    line hit: list = wmHit(x, y);
+    line over: str = "";
+    if (hit[2] as str == "body") {
+        over = hit[1] as str;
+    }
+    line old: str = ptr["over"] as str;
+    if (over != old) {
+        if (old != "") {
+            wmPointerEvent(old, "leave", [wlsSerial(), num.parse(old.split(":")[2] as str)]);
+        }
+        if (over != "") {
+            wmPointerEvent(over, "enter", [wlsSerial(), num.parse(over.split(":")[2] as str), hit[3], hit[4]]);
+        }
+    } else if (over != "" && moved == 1) {
+        wmPointerEvent(over, "motion", [wlsTime(), hit[3], hit[4]]);
+    }
+    ptr["over"] = over;
+    ptr["sx"] = hit[3];
+    ptr["sy"] = hit[4];
+    global "s.ptr" = ptr;
+    if (global "s.clicks".len() > 0) {
+        line clicks: list[num] = global "s.clicks";
+        global "s.clicks" = list.create() as list[num];
+        for (line button of clicks) {
+            wmClick(button as num, hit);
+        }
+    }
+    if (global "s.keys".len() > 0) {
+        line keys: list = global "s.keys";
+        global "s.keys" = list.create();
+        for (line k of keys) {
+            line kp: list = k as list;
+            wmKey(kp[1] as num, kp[2] as num);
+        }
+    }
+}
+
+/** A click with evdev button `button` on what `hit` (from wmHit) found. */
+function wmClick(button: num, hit: list) {
+    if (global "s.ptr"["drag"] as str != "") {
+        // A click drops a dragged window.
+        global "s.ptr"["drag"] = "";
+        return;
+    }
+    line key: str = hit[1] as str;
+    if (key == "") {
+        return;
+    }
+    wmFocus(key);
+    line part: str = hit[2] as str;
+    line p: list = key.split(":");
+    line c: num = num.parse(p[1] as str);
+    line id: num = num.parse(p[2] as str);
+    if (part == "close") {
+        wlsSend(c, wlsGet(c, id, "top") as num, "xdg_toplevel", "close", list.create());
+    } else if (part == "title") {
+        global "s.ptr"["drag"] = key;
+        global "s.ptr"["ddx"] = hit[3];
+        global "s.ptr"["ddy"] = hit[4];
+    } else {
+        // DF reports clicks, not presses, so each is a press and a release.
+        line t: num = wlsTime();
+        wmPointerEvent(key, "button", [wlsSerial(), t, button, 1]);
+        wmPointerEvent(key, "button", [wlsSerial(), t, button, 0]);
+    }
+}
+
+/** Types evdev key `code` (with shift held if shift is 1) into the focused window. */
+function wmKey(code: num, shift: num) {
+    line key: str = global "s.focus";
+    if (key == "") {
+        return;
+    }
+    line c: num = num.parse(key.split(":")[1] as str);
+    if (!var.exists(global "s.kbds %var(c)")) {
+        return;
+    }
+    line t: num = wlsTime();
+    for (line kb of global "s.kbds %var(c)") {
+        line k: num = kb as num;
+        if (shift == 1) {
+            wlsSend(c, k, "wl_keyboard", "modifiers", [wlsSerial(), 1, 0, 0, 0]);
+        }
+        wlsSend(c, k, "wl_keyboard", "key", [wlsSerial(), t, code, 1]);
+        wlsSend(c, k, "wl_keyboard", "key", [wlsSerial(), t, code, 0]);
+        if (shift == 1) {
+            wlsSend(c, k, "wl_keyboard", "modifiers", [wlsSerial(), 0, 0, 0, 0]);
+        }
+    }
+}

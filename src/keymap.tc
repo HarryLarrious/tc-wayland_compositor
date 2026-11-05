@@ -1,0 +1,70 @@
+// keymap.tc: a US keyboard as raw evdev key codes. The compositor sends
+// keymap format 0 (no_keymap), so both ends use this table: kb.code maps a
+// character to code * 2 + shift, kb.char maps "<code>" or "<code>s"
+// (shifted) back to the character.
+
+declare global "kb.code": dict;
+declare global "kb.char": dict;
+
+/** Key codes of special keys, by @key name. */
+function kbSpecial(name: str): num {
+    line names: dict = {enter: 28, back: 14, tab: 15, esc: 1, up: 103, down: 108, left: 105, right: 106, space: 57};
+    if (names.hasKey(name)) {
+        return names[name] as num;
+    }
+    return 0;
+}
+
+/** Fills the key tables, once. */
+function kbInit {
+    if (var.exists(global "kb.code")) {
+        return;
+    }
+    line code: dict = {};
+    line chars: dict = {};
+    // [first code, plain characters, shifted characters], one keyboard row each.
+    line rows: list = [[2, "1234567890-=", "!@#$%^&*()_+"], [16, "qwertyuiop[]", "QWERTYUIOP{}"], [30, "asdfghjkl;'`", "ASDFGHJKL:\"~"], [43, "\\", "|"], [44, "zxcvbnm,./", "ZXCVBNM<>?"], [57, " ", " "]];
+    for (line row of rows) {
+        line r: list = row as list;
+        line first: num = r[1] as num;
+        line plain: str = r[2] as str;
+        line shifted: str = r[3] as str;
+        repeat (line i to plain.len()) {
+            line k: num = first + i - 1;
+            line a: str = plain.trim(i, i);
+            line b: str = shifted.trim(i, i);
+            code[a] = k * 2;
+            if (b != a) {
+                code[b] = k * 2 + 1;
+            }
+            chars["%var(k)"] = a;
+            chars["%var(k)s"] = b;
+        }
+    }
+    global "kb.code" = code;
+    global "kb.char" = chars;
+}
+
+/** The character for key `code` (shift 1 when shifted), or "" for keys that type none. */
+function kbChar(code: num, shift: num): str {
+    line key: str = "%var(code)";
+    if (shift == 1) {
+        key = "%var(code)s";
+    }
+    if (global "kb.char".hasKey(key)) {
+        return global "kb.char"[key] as str;
+    }
+    return "";
+}
+
+/** Queues a typed line for the focused window: one key per character, then Enter. */
+function kbQueueLine(text: str) {
+    repeat (line i to text.len()) {
+        line ch: str = text.trim(i, i);
+        if (global "kb.code".hasKey(ch)) {
+            line v: num = global "kb.code"[ch] as num;
+            global "s.keys".append([num.floor(v / 2), v % 2]);
+        }
+    }
+    global "s.keys".append([28, 0]);
+}

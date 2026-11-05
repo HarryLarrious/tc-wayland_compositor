@@ -1,0 +1,53 @@
+// tests.tc: in-game self-test of the kernel and wire codec (@wl test).
+// Prints WLTEST lines; tools/read_test.sh collects them from the client log.
+
+/** Prints one WLTEST result: pass when got equals want. */
+function wlCheck(name: str, got: any, want: any) {
+    if (got == want) {
+        allPlayers.sendMessage("WLTEST PASS %var(name)");
+    } else {
+        allPlayers.sendMessage("WLTEST FAIL %var(name): got %var(got), want %var(want)");
+    }
+}
+
+/** Runs every self-test. */
+function wlSelfTest {
+    wlInit();
+    allPlayers.sendMessage("WLTEST BEGIN");
+    wlCheck("find space", global "wl.ascii".find(" "), 1);
+    wlCheck("find tilde", global "wl.ascii".find("~"), 95);
+    wlCheck("int -5", wlInt(-5), 4294967291);
+    wlCheck("signed", wlSigned(4294967291), -5);
+    wlCheck("byte 3", wlByte(4278255360, 3), 255);
+    wlCheck("byte 1", wlByte(4278255360, 1), 255);
+    wlCheck("byte 0", wlByte(4278255360, 0), 0);
+    line sw: list[num] = wlStrWords("wl_shm");
+    wlCheck("str words", sw.len(), 3);
+    wlCheck("str back", wlStrAt(sw, 1), "wl_shm");
+    line sw4: list[num] = wlStrWords("abcd");
+    wlCheck("str4 words", sw4.len(), 3);
+    wlCheck("str4 back", wlStrAt(sw4, 1), "abcd");
+    line words: list[num] = wlEncode("req", "wl_registry", 2, "bind", [3, "xdg_wm_base", 1, 7]);
+    line frames: list = wlFrames(words);
+    wlCheck("frames", frames.len(), 1);
+    line fr: list = frames[1] as list;
+    wlCheck("frame obj", fr[1], 2);
+    wlCheck("frame op", fr[2], 0);
+    line args: list = wlDecode(wlSpec("req", "wl_registry", 0), fr[3] as list[num]);
+    wlCheck("bind name", args[1], 3);
+    wlCheck("bind iface", args[2], "xdg_wm_base");
+    wlCheck("bind version", args[3], 1);
+    wlCheck("bind id", args[4], 7);
+    line ev: list[num] = wlEncode("ev", "wl_pointer", 9, "motion", [1234, 12.5, -3]);
+    line evf: list = wlFrames(ev)[1] as list;
+    line eva: list = wlDecode(wlSpec("ev", "wl_pointer", evf[2] as num), evf[3] as list[num]);
+    wlCheck("fixed x", eva[2], 12.5);
+    wlCheck("fixed y", eva[3], -3);
+    line two: list[num] = words;
+    two.appendList(ev);
+    wlCheck("two frames", wlFrames(two).len(), 2);
+    line fd: num = kMemCreate(100);
+    wlCheck("memfd words", global "k.mem %var(fd)".len(), 25);
+    kMemFree(fd);
+    allPlayers.sendMessage("WLTEST DONE");
+}

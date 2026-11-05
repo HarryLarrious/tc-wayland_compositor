@@ -1,0 +1,207 @@
+// wire.tc: the Wayland wire format, as lists of 32-bit words (unsigned,
+// 0 to 2^32 - 1). A message is [object id, size << 16 | opcode, args...],
+// with size in bytes. A string or array is its byte length, then the bytes
+// four to a word (little-endian), padded with zeros; a string's length
+// counts its NUL. Fds travel in the fd queue, not in the words.
+//
+// DF's bitwise actions work on 32-bit signed ints, so words that can reach
+// 2^31 are split with % and exact division, never shifted.
+
+/** Printable ASCII from 32 (space) to 126: character n is at index n - 31. */
+declare global "wl.ascii": str;
+
+/** Fills the protocol and character tables, once. */
+function wlInit {
+    if (!var.exists(global "wl.ascii")) {
+        global "wl.ascii" = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+        wlProtoInit();
+    }
+}
+
+/** A signed int as a word (two's complement). */
+function wlInt(v: num): num {
+    if (v < 0) {
+        return v + 4294967296;
+    }
+    return v;
+}
+
+/** A word as a signed int. */
+function wlSigned(w: num): num {
+    if (w >= 2147483648) {
+        return w - 4294967296;
+    }
+    return w;
+}
+
+/** Byte k (0-3, 0 is the lowest) of word w. */
+function wlByte(w: num, k: num): num {
+    line scale: num = 256 ** k;
+    return ((w - w % scale) / scale) % 256;
+}
+
+/** Words for string s: its length with the NUL, then its bytes. Characters outside printable ASCII become "?". */
+function wlStrWords(s: str): list[num] {
+    line n: num = s.len();
+    line out: list[num] = [n + 1];
+    line word: num = 0;
+    line k: num = 0;
+    repeat (line i to n) {
+        line b: num = global "wl.ascii".find(s.trim(i, i));
+        if (b < 1) {
+            b = 63;
+        } else {
+            b += 31;
+        }
+        word += b * 256 ** k;
+        k += 1;
+        if (k == 4) {
+            out.append(word);
+            word = 0;
+            k = 0;
+        }
+    }
+    // The NUL is the next byte: it ends the partial word, or starts a new one.
+    out.append(word);
+    return out;
+}
+
+/** The string whose length word is at body[p]. */
+function wlStrAt(body: list[num], p: num): str {
+    line n: num = body[p] as num;
+    line out: str = "";
+    repeat (line i to n - 1) {
+        line w: num = body[p + 1 + num.floor((i - 1) / 4)] as num;
+        line b: num = wlByte(w, (i - 1) % 4);
+        if (b >= 32 && b <= 126) {
+            out = out + global "wl.ascii".trim(b - 31, b - 31);
+        } else {
+            out = out + "?";
+        }
+    }
+    return out;
+}
+
+/** Words that a string or array whose length word is `bytes` takes, including that word. */
+function wlSpan(bytes: num): num {
+    return 1 + num.round(bytes / 4, mode="Ceiling");
+}
+
+/** The signature string of message `name` of iface; table is "req" or "ev". */
+function wlSpec(table: str, iface: str, op: num): str {
+    if (table == "req") {
+        return (global "wl.req"[iface] as list[str])[op + 1] as str;
+    }
+    return (global "wl.ev"[iface] as list[str])[op + 1] as str;
+}
+
+/**
+ * Encodes message `name` of iface on object obj; table is "req" or "ev".
+ * values follow the signature: numbers, strings, lists of words for arrays;
+ * an untyped new_id takes three values (interface, version, id). fd values
+ * are skipped here: pass them to kSend.
+ */
+function wlEncode(table: str, iface: str, obj: num, name: str, values: list): list[num] {
+    line key: str = "%var(iface).%var(name)";
+    line op: num = 0;
+    if (table == "req") {
+        op = global "wl.reqop"[key] as num;
+    } else {
+        op = global "wl.evop"[key] as num;
+    }
+    line tokens: list[str] = wlSpec(table, iface, op).split(" ");
+    line args: list[num] = list.create() as list[num];
+    line vi: num = 1;
+    repeat (line t to tokens.len() - 1) {
+        line kind: str = (tokens[t + 1] as str).trim(1, 1);
+        if (kind == "i") {
+            args.append(wlInt(values[vi] as num));
+        } else if (kind == "f") {
+            args.append(wlInt(num.round((values[vi] as num) * 256)));
+        } else if (kind == "s") {
+            args.appendList(wlStrWords(values[vi] as str));
+        } else if (kind == "a") {
+            line arr: list[num] = values[vi] as list[num];
+            args.append(arr.len() * 4);
+            args.appendList(arr);
+        } else if (kind == "N") {
+            args.appendList(wlStrWords(values[vi] as str));
+            args.append(values[vi + 1] as num);
+            args.append(values[vi + 2] as num);
+            vi += 2;
+        } else if (kind != "h") {
+            args.append(values[vi] as num);
+        }
+        vi += 1;
+    }
+    line words: list[num] = [obj, (8 + args.len() * 4) * 65536 + op];
+    words.appendList(args);
+    return words;
+}
+
+/**
+ * Decodes the arguments of a message with signature spec from its body (the
+ * words after the header). Strings come out as strings, arrays as lists of
+ * words, fds as -1 (take them from the fd queue).
+ */
+function wlDecode(spec: str, body: list[num]): list {
+    line tokens: list[str] = spec.split(" ");
+    line out: list = list.create();
+    line p: num = 1;
+    repeat (line t to tokens.len() - 1) {
+        line kind: str = (tokens[t + 1] as str).trim(1, 1);
+        if (kind == "i") {
+            out.append(wlSigned(body[p] as num));
+            p += 1;
+        } else if (kind == "f") {
+            out.append(wlSigned(body[p] as num) / 256);
+            p += 1;
+        } else if (kind == "s") {
+            out.append(wlStrAt(body, p));
+            p += wlSpan(body[p] as num);
+        } else if (kind == "a") {
+            line span: num = wlSpan(body[p] as num);
+            if (span > 1) {
+                out.append(body.trim(p + 1, p + span - 1));
+            } else {
+                out.append(list.create());
+            }
+            p += span;
+        } else if (kind == "N") {
+            out.append(wlStrAt(body, p));
+            p += wlSpan(body[p] as num);
+            out.append(body[p] as num);
+            out.append(body[p + 1] as num);
+            p += 2;
+        } else if (kind == "h") {
+            out.append(-1);
+        } else {
+            out.append(body[p] as num);
+            p += 1;
+        }
+    }
+    return out;
+}
+
+/**
+ * Splits a run of words into messages: a list of [object id, opcode, body],
+ * body being the words after the header.
+ */
+function wlFrames(words: list[num]): list {
+    line out: list = list.create();
+    line p: num = 1;
+    while (p + 1 <= words.len()) {
+        line obj: num = words[p] as num;
+        line w1: num = words[p + 1] as num;
+        line op: num = w1 % 65536;
+        line size: num = (w1 - op) / 65536;
+        line count: num = num.max(2, size / 4);
+        line body: list = list.create();
+        if (count > 2) {
+            body = words.trim(p + 2, p + count - 1);
+        }
+        out.append([obj, op, body]);
+        p += count;
+    }
+    return out;
+}

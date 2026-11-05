@@ -1,0 +1,112 @@
+// render.tc: puts window pixels on screen. A window is a stack of text
+// displays ("bands"), one text line per pixel row; each 32-bit buffer word is
+// one pixel glyph (font wl:px, see README). A commit marks the bands its
+// damage touches; wmRender redraws marked bands within a glyph budget per
+// tick, and once a window has none left its commit is presented: the buffer
+// is released and its frame callbacks run.
+
+/**
+ * MiniMessage for rows y0..y1 (0-based) of an image in shared-memory file
+ * fd: `cols` words per row starting at word `first` (1-based), `stride`
+ * words apart. glyphBase is 1 for argb8888 and 257 for rgb332; opaque 1
+ * draws every word with alpha 255 (xrgb8888).
+ */
+function wmBandText(fd: num, first: num, stride: num, cols: num, y0: num, y1: num, glyphBase: num, opaque: num): str {
+    line rows: list[str] = list.create() as list[str];
+    repeat (line yi to y1 - y0 + 1) {
+        line rowStart: num = first + (y0 + yi - 1) * stride;
+        line words: list[num] = global "k.mem %var(fd)".trim(rowStart, rowStart + cols - 1);
+        line row: list[str] = list.create() as list[str];
+        for (line w of words) {
+            // DF's bitwise actions are 32-bit signed: split the top byte off with
+            // exact arithmetic first (README, Spike results).
+            line wn: num = w as num;
+            line low: num = wn % 16777216;
+            line top: num = 255;
+            if (opaque == 0) {
+                top = (wn - low) / 16777216;
+            }
+            line gl: str = global "px.glyphs"[top + glyphBase] as str;
+            line hr: str = global "px.hex"[(low >> 16) + 1] as str;
+            line hg: str = global "px.hex"[((low >> 8) & 255) + 1] as str;
+            line hb: str = global "px.hex"[(low & 255) + 1] as str;
+            row.append("<c:#%var(hr)%var(hg)%var(hb)>%var(gl)</c>");
+        }
+        rows.append(row.join(""));
+    }
+    return "<font:wl:px>" + rows.join("<br>");
+}
+
+/** Sets display uid's text. */
+function wmSetText(uid: str, text: str) {
+    select entitiesByUUID(uid);
+    selectedEntity.setTextDisplayText(txt.parseExpression(text, allowed="Full"));
+    select reset;
+}
+
+/** Redraws marked bands and title bars, at most about `budget` glyphs this tick. */
+function wmRender(budget: num) {
+    line left: num = budget;
+    line windows: list[str] = global "s.windows";
+    for (line key of windows) {
+        line p: list = (key as str).split(":");
+        line c: num = num.parse(p[1] as str);
+        line id: num = num.parse(p[2] as str);
+        if (var.exists(global "s.o %var(c) %var(id)") && wlsGet(c, id, "mapped") as num == 1) {
+            line st: dict = global "s.o %var(c) %var(id)";
+            if (st["decoDirty"] as num == 1 && left > 0) {
+                line dc: num = st["decoCols"] as num;
+                wmSetText(st["deco"] as str, wmBandText(st["decoFd"] as num, 1, dc, dc, 0, wmDecoH() - 1, 257, 0));
+                wlsPut(c, id, "decoDirty", 0);
+                left -= dc * wmDecoH();
+            }
+            line dirty: list[num] = st["dirty"] as list[num];
+            if (dirty.len() > 0 && left > 0) {
+                line before: num = dirty.len();
+                dirty = wmRenderBands(c, id, dirty, left);
+                wlsPut(c, id, "dirty", dirty);
+                left -= (before - dirty.len()) * (st["cols"] as num) * (st["bandRows"] as num);
+            }
+            if (dirty.len() == 0 && st["present"] as num == 1) {
+                wlsPut(c, id, "present", 0);
+                wlsPresented(c, id);
+            }
+        }
+    }
+}
+
+/** Renders bands from `dirty` until about `budget` glyphs are drawn; returns the bands still marked. */
+function wmRenderBands(c: num, id: num, dirty: list[num], budget: num): list[num] {
+    line st: dict = global "s.o %var(c) %var(id)";
+    line buf: num = st["buf"] as num;
+    if (wlsIface(c, buf) != "wl_buffer") {
+        return list.create() as list[num];
+    }
+    line b: dict = global "s.o %var(c) %var(buf)" as dict;
+    line fd: num = b["fd"] as num;
+    line cols: num = st["cols"] as num;
+    line h: num = st["h"] as num;
+    line bandRows: num = st["bandRows"] as num;
+    line format: num = b["format"] as num;
+    line glyphBase: num = 1;
+    if (format == 943867730) {
+        glyphBase = 257;
+    }
+    line opaque: num = 0;
+    if (format == 1) {
+        opaque = 1;
+    }
+    line first: num = (b["offset"] as num) / 4 + 1;
+    line stride: num = (b["stride"] as num) / 4;
+    line uuids: list[str] = st["displays"] as list[str];
+    line left: num = budget;
+    while (dirty.len() > 0 && left > 0) {
+        line band: num = dirty[1] as num;
+        dirty.remove(1);
+        line y0: num = (band - 1) * bandRows;
+        line y1: num = num.min(band * bandRows, h) - 1;
+        wmSetText(uuids[band] as str, wmBandText(fd, first, stride, cols, y0, y1, glyphBase, opaque));
+        left -= cols * (y1 - y0 + 1);
+    }
+    return dirty;
+}

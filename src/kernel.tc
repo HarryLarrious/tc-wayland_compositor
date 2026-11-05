@@ -1,0 +1,114 @@
+// kernel.tc: the few kernel services Wayland needs, inside DF.
+//
+// Sockets: connection c is a pair of word queues, global "k.q <c> c2s"
+// (client to compositor) and "k.q <c> s2c", each with an fd queue beside it
+// ("k.fdq <c> <dir>", like SCM_RIGHTS). A message is appended whole, so a
+// reader never sees part of one.
+// Files: kMemCreate makes a shared-memory file (a memfd). Its fd is a number
+// that is valid in every process. Global "k.mem <fd>" holds the bytes as
+// 32-bit little-endian words, at most 10,000 of them (DF's list limit).
+
+declare global "k.nextConn": num;
+declare global "k.nextFd": num;
+/** Connections waiting for the compositor to accept them. */
+declare global "k.listen": list[num];
+/** Connections that have hung up (the compositor frees them). */
+declare global "k.closed": list[num];
+declare global "k.q %var(c) %var(dir)": list[num];
+declare global "k.fdq %var(c) %var(dir)": list[num];
+declare global "k.mem %var(fd)": list[num];
+
+/** Opens a connection to the compositor and returns its number. */
+function kConnect(): num {
+    global "k.nextConn" += 1;
+    line c: num = global "k.nextConn";
+    global "k.q %var(c) c2s" = list.create() as list[num];
+    global "k.q %var(c) s2c" = list.create() as list[num];
+    global "k.fdq %var(c) c2s" = list.create() as list[num];
+    global "k.fdq %var(c) s2c" = list.create() as list[num];
+    if (!var.exists(global "k.listen")) {
+        global "k.listen" = list.create() as list[num];
+    }
+    global "k.listen".append(c);
+    return c;
+}
+
+/** 1 while connection c is open. */
+function kOpen(c: num): num {
+    if (!var.exists(global "k.q %var(c) c2s")) {
+        return 0;
+    }
+    if (var.exists(global "k.closed") && global "k.closed".find(c) > 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/** Hangs up connection c; either end may call it. */
+function kHangup(c: num) {
+    if (!var.exists(global "k.closed")) {
+        global "k.closed" = list.create() as list[num];
+    }
+    if (global "k.closed".find(c) == 0) {
+        global "k.closed".append(c);
+    }
+}
+
+/** Frees connection c's queues (the compositor calls it once both ends are done). */
+function kFree(c: num) {
+    var.purgeMatching("k.q %var(c) c2s", "k.q %var(c) s2c", "k.fdq %var(c) c2s", "k.fdq %var(c) s2c", matchRequirement="Entire name");
+}
+
+/** Appends one message (its words and fds) to c's queue in direction dir ("c2s" or "s2c"). */
+function kSend(c: num, dir: str, words: list[num], fds: list[num]) {
+    if (!var.exists(global "k.q %var(c) %var(dir)")) {
+        return;
+    }
+    global "k.q %var(c) %var(dir)".appendList(words);
+    if (fds.len() > 0) {
+        global "k.fdq %var(c) %var(dir)".appendList(fds);
+    }
+}
+
+/** Takes every word waiting in c's queue in direction dir. */
+function kTake(c: num, dir: str): list[num] {
+    if (!var.exists(global "k.q %var(c) %var(dir)")) {
+        return list.create() as list[num];
+    }
+    line words: list[num] = global "k.q %var(c) %var(dir)";
+    global "k.q %var(c) %var(dir)" = list.create() as list[num];
+    return words;
+}
+
+/** Takes the next fd sent on c in direction dir, or -1 if none. */
+function kTakeFd(c: num, dir: str): num {
+    if (!var.exists(global "k.fdq %var(c) %var(dir)") || global "k.fdq %var(c) %var(dir)".len() == 0) {
+        return -1;
+    }
+    line fd: num = global "k.fdq %var(c) %var(dir)"[1] as num;
+    global "k.fdq %var(c) %var(dir)".remove(1);
+    return fd;
+}
+
+/** Makes a zeroed shared-memory file of `bytes` bytes and returns its fd. */
+function kMemCreate(bytes: num): num {
+    if (!var.exists(global "k.nextFd")) {
+        global "k.nextFd" = 0;
+    }
+    global "k.nextFd" += 1;
+    line fd: num = global "k.nextFd";
+    line words: num = num.max(1, num.round(bytes / 4, mode="Ceiling"));
+    // Doubling builds the zeros in a few list copies instead of one append per word.
+    line zeros: list[num] = [0];
+    while (zeros.len() < words) {
+        line copy: list[num] = zeros;
+        zeros.appendList(copy);
+    }
+    global "k.mem %var(fd)" = zeros.trim(1, words);
+    return fd;
+}
+
+/** Frees shared-memory file fd. */
+function kMemFree(fd: num) {
+    var.purgeMatching("k.mem %var(fd)", matchRequirement="Entire name");
+}

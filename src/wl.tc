@@ -1,0 +1,58 @@
+// wl.tc: the @wl and @key commands.
+
+/**
+ * @wl start | stop: the compositor (the wall is placed in front of you)
+ * @wl info | simple | paint | term: starts an app (and the compositor if needed)
+ * @wl look <x> <y>: turns you to look at wall pixel (x, y) (for testing the pointer)
+ * @wl stats: plot CPU, windows and connections
+ * @wl test: runs the self-test
+ */
+function wlCommand(parts: list) {
+    line sub: str = "";
+    if (parts.len() >= 2) {
+        sub = parts[2] as str;
+    }
+    if (sub == "test") {
+        wlSelfTest();
+    } else if (sub == "start") {
+        wmStart();
+        default.sendMessage(s"<gray>Compositor started. Look at a window to point; click to click; chat types into the focused window.");
+    } else if (sub == "look" && parts.len() >= 4 && wmActive() == 1) {
+        line target: loc = wmWallLoc(num.parse(parts[3] as str), num.parse(parts[4] as str), 0);
+        line eye: loc = default.eyeLocation;
+        line dir: vec = vec(target.x - eye.x, target.y - eye.y, target.z - eye.z);
+        default.teleport(default.location.setDirection(dir));
+    } else if (sub == "stats") {
+        line cpu: num = game.cpuUsage;
+        line windows: num = 0;
+        line conns: num = 0;
+        if (wmActive() == 1) {
+            windows = global "s.windows".len();
+            conns = global "s.conns".len();
+        }
+        default.sendMessage("WLSTATS cpu=%var(cpu) windows=%var(windows) connections=%var(conns)");
+    } else if (sub == "stop") {
+        wmStop();
+        default.sendMessage(s"<gray>Compositor stopped.");
+    } else if (sub == "info" || sub == "simple" || sub == "paint" || sub == "term") {
+        if (wmActive() == 0) {
+            wmStart();
+        }
+        appLaunch(sub);
+    } else {
+        default.sendMessage(s"<yellow>@wl start</yellow><gray>, </gray><yellow>@wl stop</yellow> <gray>the compositor; the wall goes in front of you");
+        default.sendMessage(s"<yellow>@wl info|simple|paint|term</yellow> <gray>starts an app");
+        default.sendMessage(s"<yellow>@key enter|back|tab|esc|up|down|left|right</yellow> <gray>types a special key");
+        default.sendMessage(s"<gray>Chat goes to the focused window. Click a title bar to drag it, the x to close it.");
+    }
+}
+
+/** @key <name>: types one special key into the focused window. */
+function keyCommand(parts: list) {
+    if (parts.len() >= 2) {
+        line code: num = kbSpecial(parts[2] as str);
+        if (code > 0 && wmActive() == 1) {
+            global "s.keys".append([code, 0]);
+        }
+    }
+}
