@@ -1,0 +1,20 @@
+// Every player gets the resource pack on join. Without it, pixel glyphs show
+// as missing-glyph boxes.
+
+/** The published pack (tools/build_pack.py --publish prints it). */
+function packUrl(): str {
+    return "https://raw.githubusercontent.com/HarryLarrious/tc-wayland_compositor/pack-dist/wl-pack-f1d27cad6a38.zip";
+}
+
+/** Sends the pack to the player. */
+function packSend {
+    default.sendResourcePack(packUrl());
+}
+
+playerevent join {
+    packSend();
+}
+
+playerevent resourcePackLoad {
+    default.sendMessage(s"<gray>Pack loaded. Try <yellow>@px still argb 64 48</yellow>.");
+}

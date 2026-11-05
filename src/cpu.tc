@@ -1,0 +1,17 @@
+// cpu.tc: keeps long-running code under a CPU budget.
+
+declare local "gen.last_instant": num;
+
+/**
+ * Waits a tick once this thread has run for long enough since its last wait.
+ * maxCpu is 0-100; the time allowed per tick shrinks as more players
+ * (up to 8) are on the plot. Call it often inside heavy loops.
+ */
+function cpuYield(maxCpu: num) {
+    line delta: num = game.microsecondsSinceStartup - local "gen.last_instant";
+    line players: num = num.min(game.playerCount, 8);
+    if (delta >= (40 + (players - 1) * 6) * 5 * maxCpu) {
+        wait;
+        local "gen.last_instant" = game.microsecondsSinceStartup;
+    }
+}

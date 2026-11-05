@@ -1,0 +1,46 @@
+{
+  "_doc": [
+    "Define sets build_pack.py compiles each overridden shader under.",
+    "Taken from net.minecraft.client.renderer.RenderPipelines (26.3).",
+    "Each shader compiles under every subset of 'flags', every choice in",
+    "'values' (null = not defined), and, when 'oit' is true, with no OIT and",
+    "with each OIT stage. This is a superset of the pipelines the game builds.",
+    "An overridden minecraft:core/* shader missing here fails the build: add it",
+    "after checking RenderPipelines for the defines its pipelines use."
+  ],
+  "oit_base": {
+    "OIT": "",
+    "OIT_WAVELET_RANK": "2",
+    "OIT_COEFF_COUNT": "8",
+    "OIT_COEFF_ATTACHMENT_COUNT": "2"
+  },
+  "oit_stages": {
+    "depth_bounds": {
+      "OIT_ALPHA_ONLY": "",
+      "OIT_DEPTH_BOUNDS": ""
+    },
+    "transmittance": {
+      "OIT_ALPHA_ONLY": "",
+      "OIT_TRANSMITTANCE": ""
+    },
+    "accumulate": {
+      "OIT_ACCUMULATE": ""
+    }
+  },
+  "device_macros": [
+    "RENDERPEARL_DEPTH_IS_ZERO_TO_ONE",
+    "RENDERPEARL_EXPLICIT_DEPTH_INVARIANCE",
+    "RENDERPEARL_INSTANCE_INDEX_INCLUDES_BASE_INSTANCE"
+  ],
+  "shaders": {
+    "minecraft:core/text": {
+      "flags": [
+        "IS_GUI",
+        "IS_SEE_THROUGH",
+        "IS_GRAYSCALE"
+      ],
+      "values": {},
+      "oit": true
+    }
+  }
+}

@@ -1,0 +1,324 @@
+// Render spike: draws a test window from pixel glyphs (font wl:px, decoded by
+// the pack's text shader) and measures what drawing a frame costs DF.
+//
+// A window is `bands` text displays stacked top to bottom, one text line per
+// pixel row. Each band keeps its own copy of every frame's buffer words
+// (global "px.f <frame> <band>"), so a frame copies only small lists. Drawing
+// a frame turns each band's words into MiniMessage (one colored glyph per
+// word) and sets the band's text. The run reports how long that takes (DF
+// time only; the client's layout and upload are not measured).
+
+/** Pixel glyph strings: index format * 256 + top byte + 1. */
+declare global "px.glyphs": list[str];
+/** Two-digit hex strings: index value + 1. */
+declare global "px.hex": list[str];
+/** Run id; starting a new window or @px stop ends the old run. */
+declare global "px.run": num;
+/** DF microseconds spent building MiniMessage strings, summed over frames (pxRun reports its share). */
+declare global "px.usBuild": num;
+/** UUIDs of the window's band displays, top to bottom. */
+declare global "px.displays": list[str];
+/** Window settings: fmt (0 argb8888, 1 rgb332), width, height, cols (words per row), bands, bandRows, frames, every. */
+declare global "px.cfg": dict;
+/** Buffer words of frame f for band b, row by row. */
+declare global "px.f %var(f) %var(b)": list[num];
+
+/** Pixels per block in the world (a glyph pixel is 10 font units at display scale 0.25). */
+function pxPerBlock(): num {
+    return 16;
+}
+
+/** Fills the glyph and hex tables, once. */
+function pxInit {
+    if (!var.exists(global "px.hex")) {
+        global "px.glyphs" = pxGlyphTable();
+        global "px.hex" = pxHexTable();
+    }
+}
+
+/** Removes the current window, if any, and ends its run. */
+function pxStop {
+    global "px.run" += 1;
+    if (var.exists(global "px.displays")) {
+        for (line uid of global "px.displays") {
+            select entitiesByUUID(uid as str);
+            selectedEntity.remove();
+            select reset;
+        }
+    }
+    global "px.displays" = list.create() as list[str];
+}
+
+/**
+ * Starts a window in front of the player. fmt 0 is argb8888, 1 is rgb332
+ * (width is rounded up to a multiple of 4). frames 1 draws one still test
+ * card; more frames loop an animation, one frame every `every` ticks.
+ */
+function pxStart(fmt: num, width: num, height: num, bands: num, frames: num, every: num) {
+    pxInit();
+    pxStop();
+    line perWord: num = 1;
+    if (fmt == 1) {
+        perWord = 4;
+    }
+    line cols: num = num.round(width / perWord, mode="Ceiling");
+    line w: num = cols * perWord;
+    if (bands < 1) {
+        // About 512 glyphs per band keeps each band's MiniMessage near 8 KB.
+        bands = num.round(height / num.max(1, num.floor(512 / cols)), mode="Ceiling");
+    }
+    line bandRows: num = num.round(height / bands, mode="Ceiling");
+    bands = num.round(height / bandRows, mode="Ceiling");
+    global "px.cfg" = {fmt: fmt, width: w, height: height, cols: cols, bands: bands, bandRows: bandRows, frames: frames, every: every};
+    pxSpawn();
+    line runId: num = global "px.run";
+    default.sendMessage(s"<gray>Painting %var(frames) frame(s) of %var(w)x%var(height)...");
+    line still: num = 0;
+    if (frames == 1) {
+        still = 1;
+    }
+    repeat (line f to frames) {
+        pxPaint(f, still);
+        if (global "px.run" != runId) {
+            return;
+        }
+    }
+    default.sendMessage(s"<gray>Drawing: %var(cols) glyphs per row, %var(bands) band(s) of %var(bandRows) rows.");
+    start pxRun;
+}
+
+/** Spawns the band displays for global "px.cfg", centered 4 blocks in front of the player. */
+function pxSpawn {
+    line cfg: dict = global "px.cfg";
+    line fmt: num = cfg["fmt"] as num;
+    line height: num = cfg["height"] as num;
+    line bandRows: num = cfg["bandRows"] as num;
+    line forward: vec = default.direction;
+    forward.y = 0;
+    if (forward.len() < 0.1) {
+        forward = vec(0, 0, 1);
+    }
+    forward = forward.setLength(1);
+    line centre: loc = default.eyeLocation + forward * 4;
+    line top: num = centre.y + height / pxPerBlock() / 2;
+    // Glyph advance in font units: 10 per argb8888 word, 40 per rgb332 word.
+    line lineWidth: num = (cfg["cols"] as num) * 10 * (1 + fmt * 3) + 10;
+    line cullW: num = (cfg["width"] as num) / pxPerBlock() + 1;
+    line cullH: num = bandRows / pxPerBlock() + 1;
+    line uuids: list[str] = list.create() as list[str];
+    repeat (line b to cfg["bands"] as num) {
+        // A text display's text sits above its origin, so the origin is the band's bottom edge.
+        line r1: num = num.min(b * bandRows, height);
+        line p: loc = centre;
+        p.y = top - r1 / pxPerBlock();
+        game.spawnTextDisplay(p, s" ");
+        lastEntity.setDisplayBillboard(type="Vertical");
+        lastEntity.setDisplayScale(0.25, 0.25, 0.25);
+        lastEntity.setTextDisplayLineWidth(lineWidth);
+        lastEntity.setTextDisplayTextAlignment(align="Left");
+        lastEntity.setTextDisplayBackground("#000000", 0);
+        lastEntity.setTextDisplayTextShadow(textShadow="Disable");
+        lastEntity.setDisplayCullingSize(cullW, cullH);
+        uuids.append(lastEntity.uuid);
+    }
+    global "px.displays" = uuids;
+}
+
+/** MiniMessage for one band's words: one colored glyph per word, rows split by <br>. */
+function pxBandText(words: list[num], cols: num, glyphBase: num): str {
+    line rows: list[str] = list.create() as list[str];
+    line row: list[str] = list.create() as list[str];
+    for (line w of words) {
+        // DF's bitwise actions work on 32-bit signed ints (the 64-bit
+        // option gives wrong results), so the top byte is split off with
+        // exact integer arithmetic first.
+        line wn: num = w as num;
+        line low: num = wn % 16777216;
+        line gl: str = global "px.glyphs"[(wn - low) / 16777216 + glyphBase] as str;
+        line hr: str = global "px.hex"[(low >> 16) + 1] as str;
+        line hg: str = global "px.hex"[((low >> 8) & 255) + 1] as str;
+        line hb: str = global "px.hex"[(low & 255) + 1] as str;
+        row.append("<c:#%var(hr)%var(hg)%var(hb)>%var(gl)</c>");
+        if (row.len() == cols) {
+            rows.append(row.join(""));
+            row = list.create() as list[str];
+        }
+    }
+    return "<font:wl:px>" + rows.join("<br>");
+}
+
+/** Sets every band's text to frame f. */
+function pxDraw(f: num) {
+    line cfg: dict = global "px.cfg";
+    line cols: num = cfg["cols"] as num;
+    line glyphBase: num = (cfg["fmt"] as num) * 256 + 1;
+    line uuids: list[str] = global "px.displays";
+    repeat (line b to uuids.len()) {
+        line words: list[num] = global "px.f %var(f) %var(b)";
+        line t0: num = game.microsecondsSinceStartup;
+        line text: str = pxBandText(words, cols, glyphBase);
+        global "px.usBuild" += game.microsecondsSinceStartup - t0;
+        select entitiesByUUID(uuids[b] as str);
+        selectedEntity.setTextDisplayText(txt.parseExpression(text, allowed="Full"));
+        select reset;
+    }
+}
+
+/**
+ * Draws frames until the run ends. Every 5 seconds it prints a PXSPIKE line:
+ * frames per second, mean DF milliseconds per frame (worst in brackets), the
+ * part of that spent building strings (the rest parses and sets the text) and
+ * mean plot CPU. A still card (1 frame) is drawn once and timed.
+ */
+process pxRun {
+    line runId: num = global "px.run";
+    line cfg: dict = global "px.cfg";
+    line frames: num = cfg["frames"] as num;
+    line every: num = cfg["every"] as num;
+    line fmtName: str = "argb8888";
+    if (cfg["fmt"] as num == 1) {
+        fmtName = "rgb332";
+    }
+    line width: num = cfg["width"] as num;
+    line height: num = cfg["height"] as num;
+    line bands: num = cfg["bands"] as num;
+    line glyphs: num = (cfg["cols"] as num) * height;
+    line label: str = "%var(fmtName) %var(width)x%var(height)";
+    line f: num = 1;
+    line count: num = 0;
+    line usSum: num = 0;
+    line usMax: num = 0;
+    line cpuSum: num = 0;
+    line since: num = game.microsecondsSinceStartup;
+    global "px.usBuild" = 0;
+    while (global "px.run" == runId) {
+        line t0: num = game.microsecondsSinceStartup;
+        pxDraw(f);
+        line spent: num = game.microsecondsSinceStartup - t0;
+        count += 1;
+        usSum += spent;
+        usMax = num.max(usMax, spent);
+        if (frames == 1) {
+            line ms: num = spent / 1000;
+            line build: num = num.round(global "px.usBuild" / 100) / 10;
+            allPlayers.sendMessage(s"PXSPIKE still %var(label) glyphs=%var(glyphs) bands=%var(bands) ms=%var(ms) build=%var(build)");
+            return;
+        }
+        f = f % frames + 1;
+        wait(every);
+        cpuSum += game.cpuUsage;
+        line elapsed: num = game.microsecondsSinceStartup - since;
+        if (elapsed >= 5000000) {
+            line fps: num = num.round(count * 10000000 / elapsed) / 10;
+            line ms: num = num.round(usSum / count / 100) / 10;
+            line worst: num = num.round(usMax / 100) / 10;
+            line cpu: num = num.round(cpuSum / count);
+            line build: num = num.round(global "px.usBuild" / count / 100) / 10;
+            allPlayers.sendMessage(s"PXSPIKE run %var(label) glyphs=%var(glyphs) bands=%var(bands) every=%var(every) fps=%var(fps) ms=%var(ms) (%var(worst)) build=%var(build) cpu=%var(cpu)");
+            global "px.usBuild" = 0;
+            count = 0;
+            usSum = 0;
+            usMax = 0;
+            cpuSum = 0;
+            since = game.microsecondsSinceStartup;
+        }
+    }
+}
+
+/** The 24-bit color of test-card pixel (x, y), 0-based; -1 for a cut-out pixel. */
+function pxCardColor(x: num, y: num, width: num, height: num): num {
+    if (y < height / 2) {
+        // Eight bars: white, yellow, cyan, green, magenta, red, blue, black.
+        line bar: num = num.floor(x * 8 / width) + 1;
+        return [0xFFFFFF, 0xFFFF00, 0x00FFFF, 0x00FF00, 0xFF00FF, 0xFF0000, 0x0000FF, 0x000000][bar] as num;
+    }
+    if (x < width / 2) {
+        // One-pixel checkerboard: any gap or blur between glyphs shows here.
+        if ((x + y) % 2 == 0) {
+            return 0xFFFFFF;
+        }
+        return 0x000000;
+    }
+    // 4-pixel checker of red and cut-out pixels (argb8888 alpha 0).
+    if ((num.floor(x / 4) + num.floor(y / 4)) % 2 == 0) {
+        return 0xFF0000;
+    }
+    return -1;
+}
+
+/** The 24-bit color of animation pixel (x, y) in frame f: gradients and a moving white square. */
+function pxAnimColor(x: num, y: num, f: num, width: num, height: num, frames: num): num {
+    line cx: num = num.floor((f - 1) * width / frames);
+    line cy: num = num.floor(height / 2);
+    if (num.abs(x - cx) < 6 && num.abs(y - cy) < 6) {
+        return 0xFFFFFF;
+    }
+    line r: num = num.floor(x * 255 / num.max(1, width - 1));
+    line g: num = num.floor(y * 255 / num.max(1, height - 1));
+    line b: num = ((x + y) * 4 + f * 32) % 256;
+    return (r << 16) | (g << 8) | b;
+}
+
+/** 24-bit color (or -1) as an rgb332 byte; cut-out pixels become black. */
+function pxTo332(c: num): num {
+    if (c < 0) {
+        return 0;
+    }
+    line r: num = (c >> 21) & 7;
+    line g: num = (c >> 13) & 7;
+    line b: num = (c >> 6) & 3;
+    return (r << 5) | (g << 2) | b;
+}
+
+/** Paints frame f into every band's word list, like a client drawing into its buffer. */
+function pxPaint(f: num, still: num) {
+    line cfg: dict = global "px.cfg";
+    line fmt: num = cfg["fmt"] as num;
+    line width: num = cfg["width"] as num;
+    line height: num = cfg["height"] as num;
+    line cols: num = cfg["cols"] as num;
+    line bandRows: num = cfg["bandRows"] as num;
+    line frames: num = cfg["frames"] as num;
+    repeat (line b to cfg["bands"] as num) {
+        line words: list[num] = list.create() as list[num];
+        line y0: num = (b - 1) * bandRows;
+        line y1: num = num.min(b * bandRows, height) - 1;
+        repeat (line yi to y1 - y0 + 1) {
+            line y: num = y0 + yi - 1;
+            repeat (line c to cols) {
+                line word: num = 0;
+                if (fmt == 0) {
+                    line x: num = c - 1;
+                    line col: num = 0;
+                    if (still) {
+                        col = pxCardColor(x, y, width, height);
+                    } else {
+                        col = pxAnimColor(x, y, f, width, height, frames);
+                    }
+                    if (col < 0) {
+                        word = 0;
+                    } else {
+                        word = 255 * 16777216 + col;
+                    }
+                } else {
+                    // Four pixels per word, the leftmost in the low byte. Words
+                    // reach 2^32, past DF's 32-bit bitwise range, so bytes are added.
+                    repeat (line s to 4) {
+                        line x: num = (c - 1) * 4 + s - 1;
+                        line col: num = 0;
+                        if (still) {
+                            col = pxCardColor(x, y, width, height);
+                        } else {
+                            col = pxAnimColor(x, y, f, width, height, frames);
+                        }
+                        word += pxTo332(col) * 256 ** (s - 1);
+                    }
+                }
+                words.append(word);
+            }
+            cpuYield(50);
+        }
+        global "px.f %var(f) %var(b)" = words;
+    }
+}
+

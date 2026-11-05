@@ -1,0 +1,58 @@
+// Chat commands. One dispatcher for the whole project: add branches here.
+
+/** Parse parts[index] as a number, or fallback if missing or bad. */
+function argNum(parts: list, index: num, fallback: num): num {
+    if (parts.len() < index) {
+        return fallback;
+    }
+    return num.parse(parts[index] as str);
+}
+
+/** Pixel format from a command word: 1 for "332" or "rgb332", else 0 (argb8888). */
+function argFormat(parts: list, index: num): num {
+    if (parts.len() >= index) {
+        line word: str = parts[index] as str;
+        if (word == "332" || word == "rgb332") {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @px start <argb|332> <width> <height> [bands] [every]: animated window
+ * @px still <argb|332> <width> <height> [bands]: test card, drawn once
+ * @px stop: removes the window
+ * @pack: sends the resource pack again
+ */
+playerevent command {
+    line parts: list = event.command.split(" ");
+    line cmd: str = (parts[1] as str).replace("@", "");
+    if (cmd == "px") {
+        line sub: str = "";
+        if (parts.len() >= 2) {
+            sub = parts[2] as str;
+        }
+        // Each argument goes through its own variable: passed straight into
+        // pxStart, the argNum results came out wrong (height 0).
+        line fmt: num = argFormat(parts, 3);
+        line width: num = argNum(parts, 4, 64);
+        line height: num = argNum(parts, 5, 48);
+        line bands: num = argNum(parts, 6, 0);
+        line every: num = argNum(parts, 7, 1);
+        if (sub == "start") {
+            pxStart(fmt, width, height, bands, 8, every);
+        } else if (sub == "still") {
+            pxStart(fmt, width, height, bands, 1, 1);
+        } else if (sub == "stop") {
+            pxStop();
+            default.sendMessage(s"<gray>Window removed.");
+        } else {
+            default.sendMessage(s"<yellow>@px start <argb|332> <width> <height> [bands] [every]</yellow> <gray>animated window, timed every 5 s");
+            default.sendMessage(s"<yellow>@px still <argb|332> <width> <height> [bands]</yellow> <gray>test card, drawn once and timed");
+            default.sendMessage(s"<yellow>@px stop</yellow> <gray>removes the window");
+        }
+    } else if (cmd == "pack") {
+        packSend();
+    }
+}
