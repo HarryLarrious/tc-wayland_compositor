@@ -2,7 +2,7 @@
 
 /**
  * @wl start | stop: the compositor (the wall is placed in front of you)
- * @wl info | simple | paint | term: starts an app (and the compositor if needed)
+ * @wl info | simple | paint | terminal: starts an app (and the compositor if needed)
  * @wl look <x> <y>: turns you to look at wall pixel (x, y) (for testing the pointer)
  * @wl stats: plot CPU, windows and connections
  * @wl test: runs the self-test
@@ -34,14 +34,14 @@ function wlCommand(parts: list) {
     } else if (sub == "stop") {
         wmStop();
         default.sendMessage(s"<gray>Compositor stopped.");
-    } else if (sub == "info" || sub == "simple" || sub == "paint" || sub == "term") {
+    } else if (sub == "info" || sub == "simple" || sub == "paint" || sub == "terminal") {
         if (wmActive() == 0) {
             wmStart();
         }
         appLaunch(sub);
     } else {
         default.sendMessage(s"<yellow>@wl start</yellow><gray>, </gray><yellow>@wl stop</yellow> <gray>the compositor; the wall goes in front of you");
-        default.sendMessage(s"<yellow>@wl info|simple|paint|term</yellow> <gray>starts an app");
+        default.sendMessage(s"<yellow>@wl info|simple|paint|terminal</yellow> <gray>starts an app");
         default.sendMessage(s"<yellow>@key enter|back|tab|esc|up|down|left|right</yellow> <gray>types a special key");
         default.sendMessage(s"<gray>Chat goes to the focused window. Click a title bar to drag it, the x to close it.");
     }

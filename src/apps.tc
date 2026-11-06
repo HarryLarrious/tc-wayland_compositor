@@ -17,7 +17,7 @@ function appLaunch(name: str): num {
         start appSimple;
     } else if (name == "paint") {
         start appPaint;
-    } else if (name == "term") {
+    } else if (name == "terminal") {
         start appTerm;
     } else {
         return 0;
@@ -238,14 +238,14 @@ function termRow(fd: num, r: num, text: str, pat: list[str]) {
 process appTerm {
     line run: num = global "wl.alive";
     fontInit();
-    line c: num = wlcConnect("term");
+    line c: num = wlcConnect("terminal");
     line w: num = 128;
     line h: num = 96;
-    line win: dict = wlcWindow(c, "term", w, h, p15Format());
+    line win: dict = wlcWindow(c, "terminal", w, h, p15Format());
     line fd: num = win["fd"] as num;
     // Light grey on near-black.
     line pat: list[str] = p15Patterns(p15Color(0xD0D0C0), p15Color(0x101018));
-    line rows: list[str] = ["tc-wayland term", "type help", ""];
+    line rows: list[str] = ["wayland term", "type help", ""];
     line input: str = "";
     line shift: num = 0;
     line redraw: num = 1;
@@ -339,7 +339,7 @@ function termRun(c: num, input: str): list[str] {
     if (cmd == "") {
         return list.create() as list[str];
     } else if (cmd == "help") {
-        return ["help clear exit", "echo ps uptime", "run info|simple", "    paint|term"];
+        return ["help clear exit", "echo ps uptime", "run info|simple", "  paint|terminal"];
     } else if (cmd == "clear") {
         return ["#clear#"];
     } else if (cmd == "exit") {
@@ -369,7 +369,7 @@ function termRun(c: num, input: str): list[str] {
                 return ["started %var(app)"];
             }
         }
-        return ["run what?"];
+        return ["err: no such app"];
     }
     return ["%var(cmd): not found"];
 }
