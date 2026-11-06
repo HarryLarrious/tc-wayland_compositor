@@ -1,5 +1,10 @@
-// tests.tc: in-game self-test of the kernel and wire codec (@wl test).
-// Prints WLTEST lines; tools/read_test.sh collects them from the client log.
+// tests.tc: in-game tests, printed to chat as WLTEST lines that
+// tools/read_test.sh collects from the client log.
+//   @wl test: the kernel and wire codec checks.
+//   On join (players with developer or owner access): the codec checks, then
+//   an end-to-end run of the compositor and its apps, and the canvas card.
+//   Deploying switches to play mode, which counts as joining, so every deploy
+//   runs them.
 
 /** Prints one WLTEST result: pass when got equals want. */
 function wlCheck(name: str, got: any, want: any) {
@@ -10,10 +15,16 @@ function wlCheck(name: str, got: any, want: any) {
     }
 }
 
-/** Runs every self-test. */
+/** @wl test: the codec checks, between WLTEST BEGIN and DONE. */
 function wlSelfTest {
-    wlInit();
     allPlayers.sendMessage("WLTEST BEGIN");
+    wlCodecChecks();
+    allPlayers.sendMessage("WLTEST DONE");
+}
+
+/** Kernel and wire codec checks. */
+function wlCodecChecks {
+    wlInit();
     wlCheck("find space", global "wl.ascii".find(" "), 1);
     wlCheck("find tilde", global "wl.ascii".find("~"), 95);
     wlCheck("int -5", wlInt(-5), 4294967291);
@@ -49,5 +60,209 @@ function wlSelfTest {
     line fd: num = kMemCreate(100);
     wlCheck("memfd words", global "k.mem %var(fd)".len(), 25);
     kMemFree(fd);
+}
+
+/** Where the join tests' player stood: eye location and UUID. */
+declare global "test.eye": loc;
+declare global "test.player": str;
+
+/** Prints a WLTEST result for a condition already reduced to 1 (true) or 0. */
+function wlCheckTrue(name: str, ok: num) {
+    wlCheck(name, ok, 1);
+}
+
+/** Starts the join tests for this player: the compositor's wall goes in front of them. */
+function wlAutoStart {
+    wmStart();
+    global "test.eye" = default.eyeLocation;
+    global "test.player" = default.uuid;
+    start wlAutoTest;
+}
+
+/** Mapped windows. */
+function wtWindows(): num {
+    if (!var.exists(global "s.windows")) {
+        return 0;
+    }
+    return global "s.windows".len();
+}
+
+/** Windows with bands still to render or a commit not yet presented. */
+function wtPending(): num {
+    line n: num = 0;
+    for (line key of global "s.windows") {
+        line p: list = (key as str).split(":");
+        line c: num = num.parse(p[1] as str);
+        line id: num = num.parse(p[2] as str);
+        if ((wlsGet(c, id, "dirty") as list).len() > 0 || wlsGet(c, id, "present") as num == 1) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/** The window key of app `name` (its wlcConnect name), or "". */
+function wtWindow(name: str): str {
+    for (line key of global "s.windows") {
+        line c: str = (key as str).split(":")[1] as str;
+        if (global "k.names".hasKey(c) && global "k.names"[c] as str == name) {
+            return key as str;
+        }
+    }
+    return "";
+}
+
+/** The memfd of window key's current buffer. */
+function wtFd(key: str): num {
+    line p: list = key.split(":");
+    line c: num = num.parse(p[1] as str);
+    line id: num = num.parse(p[2] as str);
+    line buf: num = wlsGet(c, id, "buf") as num;
+    return wlsGet(c, buf, "fd") as num;
+}
+
+/** 1 if window key's p15 buffer shows text (padded to 16) on one of its 8-pixel text rows, in the terminal's colors. */
+function wtTermShows(key: str, text: str): num {
+    line fd: num = wtFd(key);
+    line padded: str = text + "                ";
+    line want: list[str] = p15TextRows(padded.trim(1, 16), p15Patterns(p15Color(0xD0D0C0), p15Color(0x101018)));
+    repeat (line r to 12) {
+        line same: num = 1;
+        repeat (line i to 8) {
+            if (global "k.mem %var(fd)"[(r - 1) * 8 + i] as str != want[i] as str) {
+                same = 0;
+            }
+        }
+        if (same == 1) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** Waits up to `ticks` ticks for wtWindows() to reach n. */
+function wtWaitWindows(n: num, ticks: num) {
+    line waited: num = 0;
+    while (wtWindows() != n && waited < ticks) {
+        wait;
+        waited += 1;
+    }
+}
+
+/** The join tests: codec checks, the compositor and its apps end to end, and the canvas card. */
+process wlAutoTest {
+    allPlayers.sendMessage("WLTEST BEGIN");
+    wlCodecChecks();
+
+    // A bare client sees the five globals and the p15 format.
+    line c: num = wlcConnect("e2e");
+    wlcRoundtrip(c);
+    wlCheck("e2e globals", global "cl.globals %var(c)".len(), 5);
+    line shm: num = wlcBind(c, "wl_shm", 1);
+    wlcRoundtrip(c);
+    line hasP15: num = 0;
+    for (line ev of wlcPoll(c)) {
+        line e: list = ev as list;
+        if (e[3] as str == "format" && (e[4] as list)[1] as num == p15Format()) {
+            hasP15 = 1;
+        }
+    }
+    wlCheck("e2e shm offers p15", hasP15, 1);
+    wlcClose(c);
+
+    // The apps map their windows and the compositor presents them.
+    appLaunch("simple");
+    appLaunch("paint");
+    appLaunch("terminal");
+    wtWaitWindows(3, 400);
+    wlCheck("e2e three windows mapped", wtWindows(), 3);
+    line waited: num = 0;
+    while (wtPending() > 0 && waited < 200) {
+        wait;
+        waited += 1;
+    }
+    wlCheck("e2e windows presented", wtPending(), 0);
+
+    // Keyboard: a typed line reaches the terminal, which echoes it.
+    line term: str = wtWindow("terminal");
+    line found: num = 0;
+    if (term != "") {
+        found = 1;
+    }
+    wlCheckTrue("e2e terminal found", found);
+    if (term != "") {
+        wmFocus(term);
+        kbQueueLine("echo hi");
+        wait(30);
+        wlCheck("e2e terminal echo", wtTermShows(term, "hi"), 1);
+    }
+
+    // Pointer: a click paints a red dot where the pointer is.
+    line paint: str = wtWindow("paint");
+    found = 0;
+    if (paint != "") {
+        found = 1;
+    }
+    wlCheckTrue("e2e paint found", found);
+    if (paint != "") {
+        line pid: num = num.parse(paint.split(":")[2] as str);
+        wmPointerEvent(paint, "enter", [wlsSerial(), pid, 10, 20]);
+        wmPointerEvent(paint, "button", [wlsSerial(), wlsTime(), 272, 1]);
+        wmPointerEvent(paint, "button", [wlsSerial(), wlsTime(), 272, 0]);
+        wait(20);
+        line pfd: num = wtFd(paint);
+        line prow: str = (global "k.mem %var(pfd)" as list)[21] as str;
+        line px: str = prow.trim(11, 11);
+        line red: num = 0;
+        if (px == p15Color(0xE02020)) {
+            red = 1;
+        }
+        wlCheckTrue("e2e paint dot", red);
+    }
+
+    // simple redraws on every frame callback, so its rows change.
+    line simple: str = wtWindow("simple");
+    found = 0;
+    if (simple != "") {
+        found = 1;
+    }
+    wlCheckTrue("e2e simple found", found);
+    if (simple != "") {
+        line sfd: num = wtFd(simple);
+        line before: str = (global "k.mem %var(sfd)" as list[str]).join("");
+        wait(10);
+        line after: str = (global "k.mem %var(sfd)" as list[str]).join("");
+        line moved: num = 0;
+        if (before != after) {
+            moved = 1;
+        }
+        wlCheckTrue("e2e simple animates", moved);
+        // The close box: the client exits and its window goes.
+        line sp: list = simple.split(":");
+        line sc: num = num.parse(sp[1] as str);
+        line sid: num = num.parse(sp[2] as str);
+        wlsSend(sc, wlsGet(sc, sid, "top") as num, "xdg_toplevel", "close", list.create());
+        wtWaitWindows(2, 100);
+        wlCheck("e2e simple closed", wtWindows(), 2);
+    }
+    wmStop();
+
+    // Canvas: the card's size, every band under DF's 10,000-character limit,
+    // then the card on screen for 5 seconds.
+    line rows: list[str] = scrCard(480, 270);
+    wlCheck("canvas rows", rows.len(), 270);
+    wlCheck("canvas row width", (rows[135] as str).len(), 480);
+    scrStart(480, 270, 8, 0, global "test.eye" as loc, global "test.player" as str);
+    line longest: num = 0;
+    repeat (line b to global "scr.cfg"["bands"] as num) {
+        longest = num.max(longest, scrBandText(rows, b).len());
+    }
+    line fits: num = 0;
+    if (longest < 10000) {
+        fits = 1;
+    }
+    wlCheckTrue("canvas bands under 10000 chars", fits);
+    wait(100);
+    scrStop();
     allPlayers.sendMessage("WLTEST DONE");
 }

@@ -24,8 +24,21 @@ build time.
 | `@key <name>` | Types a special key: `enter`, `back`, `tab`, `esc`, `up`, `down`, `left`, `right`. |
 | `@wl look <x> <y>` | Turns you to look at wall pixel (x, y). This is for testing the pointer. |
 | `@wl test` | Runs the kernel and wire self-test (prints `WLTEST` lines). |
+| `@scr <width> <height> [bandRows] [anim]` | Shows a screen-locked test canvas over your whole view (width a multiple of 32; `anim` 1 bounces a square). `@scr stop` removes it. |
 
 Any app command starts the compositor if it isn't running.
+
+**Tests on join:** when a player with developer or owner access joins, or
+switches to play mode (which every deploy does), `tests.tc` runs:
+- the codec checks;
+- an end-to-end run of the compositor and its apps: globals and the p15
+  format, three windows mapped and presented, a typed line echoed by the
+  terminal, a click painting a dot, simple animating, and the close box;
+- the canvas card, then the card on screen for 5 seconds.
+
+It prints `WLTEST` lines to chat. After a deploy, `tools/read_test.sh 90`
+prints the run from the client log, so no keyboard or mouse input is
+needed.
 
 **Input:**
 - **Pointer:** your crosshair. Each tick the compositor casts your look ray
@@ -122,6 +135,33 @@ The compositor itself:
 - **Damage tracking:** windows that don't change cost almost nothing.
 - **Tearing:** bands reach the client on different frames, so a moving
   image can show two frames at once across a band boundary.
+
+## Screen canvas
+
+`@scr` (`screen.tc`) puts p15 bands at the player's eye and lets the text
+shader place them on a canvas over the whole window, whatever the player
+looks at. This is the full-view route to a "1080p screen".
+
+- **Marker:** a band's text is `<font:wl:p15><c:#FA<g>A5>` and its rows. The
+  color is one tag per band, so it costs DF nothing per pixel. `text.vsh`
+  reads it: red 250 and blue 165 mean canvas, and green is half the canvas
+  height.
+- **Placement:** the display sits at the eye (yaw 0, pitch 0, fixed
+  billboard), so a glyph's `Position` is its offset from the eye. That is
+  40 canvas pixels per block, and the display translation positions each
+  band. The shader snaps glyph edges to whole window pixels and draws just
+  in front of the camera, ignoring camera rotation and FOV. The canvas fits
+  the window height and is centred.
+- **Following the player:** the bands are teleported to the player's eye
+  every tick. A walking player sees the canvas jitter by a few canvas
+  pixels; a seated or still player sees none.
+
+Tested on Plot 206003 on 2026-11-05 at 480×270: the card covered the
+view, centred, not mirrored, with its one-pixel border at the window edges.
+The 5-bit color steps of rgb555 show as bands in the gradient. FPS was not
+measured (it needs the F3 overlay). The per-glyph cost from Data path
+benchmarks gives about 40 FPS static for 130k glyphs, about 60 at 384×216
+and about 24 at 640×360.
 
 ## Data path benchmarks
 
@@ -224,7 +264,8 @@ decoded by `px.glsl`).
 | `src/keymap.tc` | US evdev key table |
 | `src/events.tc` | Player clicks and chat as input |
 | `src/wl.tc`, `src/commands.tc` | `@wl`, `@key`, `@px`, `@pack` |
-| `src/tests.tc` | Self-test (`@wl test`) |
+| `src/tests.tc` | Codec self-test (`@wl test`) and the tests that run on join |
+| `src/screen.tc` | Screen-locked canvas spike (`@scr`) |
 | `src/spike.tc` | The original render spike (`@px`) |
 | `src/glyphs.tc` | Generated pixel-glyph and hex tables (`pack/src/px_assets.py`) |
 | `src/pack.tc` | Sends the pack on join |
@@ -232,7 +273,7 @@ decoded by `px.glsl`).
 | `pack/` | Resource pack source (`pack/src/` holds generators and is not shipped) |
 | `tools/build_pack.py` | Validates, builds and publishes the pack |
 | `tools/deploy.sh` | Compiles, places the code and switches to play mode |
-| `tools/read_test.sh` | Prints the last `WLTEST` run from the client log |
+| `tools/read_test.sh` | Prints the last `WLTEST` run from the client log (after a deploy: `tools/read_test.sh 90`) |
 | `tools/netrate.sh` | Prints the client's receive rate from the server, once a second |
 
 ## Build

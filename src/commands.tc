@@ -57,6 +57,8 @@ playerevent command {
         }
     } else if (cmd == "wl") {
         wlCommand(parts);
+    } else if (cmd == "scr") {
+        scrCommand(parts);
     } else if (cmd == "bench") {
         benchCommand(parts);
     } else if (cmd == "key") {

@@ -1,0 +1,227 @@
+// screen.tc: spike of a screen-locked canvas (@scr). p15 bands sit at the
+// player's eye; the text shader places them on a canvas that covers the whole
+// window (text.vsh, screen canvas), so they stay put wherever the player
+// looks. Each band's text is "<font:wl:p15><c:#FA<g>A5>" + its rows, where g
+// is half the canvas height. Glyph positions come from the band's display
+// translation: 40 canvas pixels per block, canvas (0, 0) at the window centre.
+//
+//   @scr <width> <height> [bandRows] [anim]   test card, width even; anim 1 bounces a square
+//   @scr stop
+
+/** Run id; a new canvas or @scr stop ends the old one. */
+declare global "scr.run": num;
+/** The canvas: w, h, bandRows, bands, anim, player (uuid). */
+declare global "scr.cfg": dict;
+/** Band display UUIDs, top to bottom. */
+declare global "scr.uids": list[str];
+/** The card without the square: one p15 row string per pixel row. */
+declare global "scr.bg": list[str];
+
+/** Removes the canvas and ends its run. */
+function scrStop {
+    global "scr.run" += 1;
+    if (var.exists(global "scr.uids")) {
+        for (line uid of global "scr.uids") {
+            select entitiesByUUID(uid as str);
+            selectedEntity.remove();
+            select reset;
+        }
+    }
+    global "scr.uids" = list.create() as list[str];
+}
+
+/** The test card: color bars, a gradient and checkerboards, a label and a one-pixel white border. */
+function scrCard(w: num, h: num): list[str] {
+    line rows: list[str] = list.create() as list[str];
+    line third: num = num.floor(h / 3);
+    // Bars: white, yellow, cyan, green, magenta, red, blue, black.
+    line bar: str = "";
+    for (line c of [0xFFFFFF, 0xFFFF00, 0x00FFFF, 0x00FF00, 0xFF00FF, 0xFF0000, 0x0000FF, 0x000000]) {
+        bar = bar + p15Color(c as num).repeat(w / 8);
+    }
+    repeat (third) {
+        rows.append(bar);
+    }
+    // Gradient: red across, green down, blue the inverse of red.
+    repeat (line y to third) {
+        line parts: list[str] = list.create() as list[str];
+        repeat (line x to w) {
+            line r: num = num.floor((x - 1) * 255 / (w - 1));
+            line g: num = num.floor((y - 1) * 255 / num.max(1, third - 1));
+            parts.append(p15Color((r << 16) + (g << 8) + 255 - r));
+        }
+        rows.append(parts.join(""));
+        cpuYield(40);
+    }
+    // Checkerboards: one-pixel black and white on the left, 8-pixel red and blue on the right.
+    line white: str = p15Color(0xFFFFFF);
+    line black: str = p15Color(0x000000);
+    line red: str = p15Color(0xFF0000);
+    line blue: str = p15Color(0x0000FF);
+    line fineA: str = (white + black).repeat(w / 4);
+    line fineB: str = (black + white).repeat(w / 4);
+    line coarseA: str = (red.repeat(8) + blue.repeat(8)).repeat(w / 32);
+    line coarseB: str = (blue.repeat(8) + red.repeat(8)).repeat(w / 32);
+    repeat (line y to h - third * 2) {
+        line left: str = fineB;
+        if (y % 2 == 1) {
+            left = fineA;
+        }
+        if (num.floor((y - 1) / 8) % 2 == 0) {
+            rows.append(left + coarseA);
+        } else {
+            rows.append(left + coarseB);
+        }
+    }
+    // Label on the bars.
+    line text: list[str] = p15TextRows("%var(w)x%var(h) canvas", p15Patterns(white, black));
+    repeat (line i to 8) {
+        rows[4 + i] = p15Splice(rows[4 + i] as str, 4, text[i] as str);
+    }
+    // Border: the canvas edges, to check it lines up with the window.
+    line edge: str = white.repeat(w);
+    rows[1] = edge;
+    rows[h] = edge;
+    repeat (line y to h) {
+        line row: str = rows[y] as str;
+        rows[y] = white + row.trim(2, w - 1) + white;
+    }
+    return rows;
+}
+
+/** Band b's text from canvas rows. */
+function scrBandText(rows: list[str], b: num): str {
+    line cfg: dict = global "scr.cfg";
+    line bandRows: num = cfg["bandRows"] as num;
+    line h: num = cfg["h"] as num;
+    line half: str = global "px.hex"[(h / 2) + 1] as str;
+    line y0: num = (b - 1) * bandRows + 1;
+    line y1: num = num.min(b * bandRows, h);
+    return "<font:wl:p15><c:#fa%var(half)a5>" + rows.trim(y0, y1).join("\n");
+}
+
+/** Sets band b's display text from canvas rows. */
+function scrSetBand(rows: list[str], b: num) {
+    select entitiesByUUID(global "scr.uids"[b] as str);
+    selectedEntity.setTextDisplayText(txt.parseExpression(scrBandText(rows, b), allowed="Full"));
+    select reset;
+}
+
+/** Starts a canvas of w x h pixels (w a multiple of 32) for the player with UUID `playerId`, whose eye is at `eye`. */
+function scrStart(w: num, h: num, bandRows: num, anim: num, eye: loc, playerId: str) {
+    fontInit();
+    pxInit();
+    scrStop();
+    w = num.round(w / 32, mode="Ceiling") * 32;
+    // DF strings hold 10,000 characters; each row also takes a newline.
+    bandRows = num.max(1, num.min(bandRows, num.floor(9980 / (w + 1))));
+    line bands: num = num.round(h / bandRows, mode="Ceiling");
+    global "scr.cfg" = {w: w, h: h, bandRows: bandRows, bands: bands, anim: anim, player: playerId};
+    line rows: list[str] = scrCard(w, h);
+    global "scr.bg" = rows;
+    eye = eye.setDirection(vec(0, 0, 1));
+    line uids: list[str] = list.create() as list[str];
+    repeat (line b to bands) {
+        game.spawnTextDisplay(eye, s" ");
+        lastEntity.setDisplayBillboard(type="Fixed");
+        // A p15 glyph is 2 x 10 font units: at this scale one is 1/40 block square.
+        lastEntity.setDisplayScale(0.5, 0.1, 0.1);
+        lastEntity.setTextDisplayLineWidth(w * 2 + 10);
+        lastEntity.setTextDisplayTextAlignment(align="Left");
+        lastEntity.setTextDisplayBackground("#000000", 0);
+        lastEntity.setTextDisplayTextShadow(textShadow="Disable");
+        lastEntity.setDisplayCullingSize(4, 4);
+        // A display's text sits above its origin: put the origin at the band's bottom row.
+        line bottom: num = num.min(b * bandRows, h) - h / 2;
+        lastEntity.setDisplayTranslation(0, 0 - bottom / 40, 0);
+        uids.append(lastEntity.uuid);
+    }
+    global "scr.uids" = uids;
+    repeat (line b to bands) {
+        scrSetBand(rows, b);
+    }
+    start scrRun;
+}
+
+/**
+ * Keeps the bands at the player's eye every tick and, with anim, bounces a
+ * 16-pixel square, redrawing only the bands it touches. Every 100 ticks it
+ * prints an SCR line with the mean DF microseconds per tick.
+ */
+process scrRun {
+    line run: num = global "scr.run";
+    line cfg: dict = global "scr.cfg";
+    line w: num = cfg["w"] as num;
+    line h: num = cfg["h"] as num;
+    line bandRows: num = cfg["bandRows"] as num;
+    line anim: num = cfg["anim"] as num;
+    line rows: list[str] = global "scr.bg";
+    line bg: list[str] = global "scr.bg";
+    line square: str = p15Color(0xFFFFFF).repeat(16);
+    line sx: num = 20;
+    line sy: num = 20;
+    line vx: num = 3;
+    line vy: num = 2;
+    line spent: num = 0;
+    line ticks: num = 0;
+    while (global "scr.run" == run) {
+        line t0: num = game.microsecondsSinceStartup;
+        select playersByName(cfg["player"] as str);
+        line eye: loc = selected.eyeLocation.setDirection(vec(0, 0, 1));
+        select reset;
+        for (line uid of global "scr.uids") {
+            select entitiesByUUID(uid as str);
+            selectedEntity.teleport(eye);
+            select reset;
+        }
+        if (anim == 1) {
+            line oy: num = sy;
+            sx += vx;
+            sy += vy;
+            if (sx < 1 || sx + 16 > w - 1) {
+                vx = 0 - vx;
+                sx += 2 * vx;
+            }
+            if (sy < 1 || sy + 16 > h - 1) {
+                vy = 0 - vy;
+                sy += 2 * vy;
+            }
+            repeat (line r to 16) {
+                rows[oy + r] = bg[oy + r];
+            }
+            repeat (line r to 16) {
+                rows[sy + r] = p15Splice(bg[sy + r] as str, sx, square);
+            }
+            // Bands the old and new square cover (rows are 0-based here).
+            line first: num = num.floor(num.min(oy, sy) / bandRows) + 1;
+            line last: num = num.floor((num.max(oy, sy) + 15) / bandRows) + 1;
+            repeat (line b to last - first + 1) {
+                scrSetBand(rows, first + b - 1);
+            }
+        }
+        spent += game.microsecondsSinceStartup - t0;
+        ticks += 1;
+        if (ticks == 100) {
+            line us: num = num.round(spent / ticks);
+            allPlayers.sendMessage("SCR %var(w)x%var(h) bandRows=%var(bandRows) anim=%var(anim) us/tick=%var(us)");
+            spent = 0;
+            ticks = 0;
+        }
+        wait;
+    }
+}
+
+/** @scr <width> <height> [bandRows] [anim] | @scr stop */
+function scrCommand(parts: list) {
+    if (parts.len() >= 2 && parts[2] as str == "stop") {
+        scrStop();
+        default.sendMessage(s"<gray>Canvas removed.");
+        return;
+    }
+    line w: num = argNum(parts, 2, 480);
+    line h: num = argNum(parts, 3, 270);
+    line bandRows: num = argNum(parts, 4, 8);
+    line anim: num = argNum(parts, 5, 0);
+    default.sendMessage(s"<gray>Painting the canvas...");
+    scrStart(w, h, bandRows, anim, default.eyeLocation, default.uuid);
+}
