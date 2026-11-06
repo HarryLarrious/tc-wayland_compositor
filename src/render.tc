@@ -1,9 +1,11 @@
 // render.tc: puts window pixels on screen. A window is a stack of text
-// displays ("bands"), one text line per pixel row; each 32-bit buffer word is
-// one pixel glyph (font wl:px, see README). A commit marks the bands its
-// damage touches; wmRender redraws marked bands within a glyph budget per
-// tick, and once a window has none left its commit is presented: the buffer
-// is released and its frame callbacks run.
+// displays ("bands"), one text line per pixel row. p15 buffers already hold
+// glyph rows, so a band is their rows joined (README, Data path benchmarks);
+// argb8888, xrgb8888 and rgb332 buffers turn each 32-bit word into a colored
+// wl:px glyph, which costs DF about 150 times more. A commit marks the bands
+// its damage touches; wmRender redraws marked bands within a budget per tick,
+// and once a window has none left its commit is presented: the buffer is
+// released and its frame callbacks run.
 
 /**
  * MiniMessage for rows y0..y1 (0-based) of an image in shared-memory file
@@ -15,7 +17,7 @@ function wmBandText(fd: num, first: num, stride: num, cols: num, y0: num, y1: nu
     line rows: list[str] = list.create() as list[str];
     repeat (line yi to y1 - y0 + 1) {
         line rowStart: num = first + (y0 + yi - 1) * stride;
-        line words: list[num] = global "k.mem %var(fd)".trim(rowStart, rowStart + cols - 1);
+        line words: list[num] = global "k.mem %var(fd)".trim(rowStart, rowStart + cols - 1) as list[num];
         line row: list[str] = list.create() as list[str];
         for (line w of words) {
             // DF's bitwise actions are 32-bit signed: split the top byte off with
@@ -37,6 +39,25 @@ function wmBandText(fd: num, first: num, stride: num, cols: num, y0: num, y1: nu
     return "<font:wl:px>" + rows.join("<br>");
 }
 
+/** Text for rows y0..y1 (0-based) of p15 image fd whose first row is entry `first` (1-based). */
+function wmBandTextP15(fd: num, first: num, y0: num, y1: num): str {
+    line rows: list[str] = global "k.mem %var(fd)".trim(first + y0, first + y1) as list[str];
+    return "<font:wl:p15>" + rows.join("\n");
+}
+
+/**
+ * Budget units for redrawing `glyphs` glyphs of buffer format `format`. A p15
+ * glyph costs DF almost nothing, but each one the client re-processes costs
+ * it about 3-4 us, so p15 glyphs count a fifth: 1500 units is 7500 p15 glyphs
+ * a tick, about what the client absorbs at 60 FPS.
+ */
+function wmCost(format: num, glyphs: num): num {
+    if (format == p15Format()) {
+        return glyphs / 5;
+    }
+    return glyphs;
+}
+
 /** Sets display uid's text. */
 function wmSetText(uid: str, text: str) {
     select entitiesByUUID(uid);
@@ -44,7 +65,7 @@ function wmSetText(uid: str, text: str) {
     select reset;
 }
 
-/** Redraws marked bands and title bars, at most about `budget` glyphs this tick. */
+/** Redraws marked bands and title bars, at most about `budget` units (wmCost) this tick. */
 function wmRender(budget: num) {
     line left: num = budget;
     line windows: list[str] = global "s.windows";
@@ -55,17 +76,16 @@ function wmRender(budget: num) {
         if (var.exists(global "s.o %var(c) %var(id)") && wlsGet(c, id, "mapped") as num == 1) {
             line st: dict = global "s.o %var(c) %var(id)";
             if (st["decoDirty"] as num == 1 && left > 0) {
-                line dc: num = st["decoCols"] as num;
-                wmSetText(st["deco"] as str, wmBandText(st["decoFd"] as num, 1, dc, dc, 0, wmDecoH() - 1, 257, 0));
+                wmSetText(st["deco"] as str, wmBandTextP15(st["decoFd"] as num, 1, 0, wmDecoH() - 1));
                 wlsPut(c, id, "decoDirty", 0);
-                left -= dc * wmDecoH();
+                left -= wmCost(p15Format(), (st["w"] as num) * wmDecoH());
             }
             line dirty: list[num] = st["dirty"] as list[num];
             if (dirty.len() > 0 && left > 0) {
                 line before: num = dirty.len();
                 dirty = wmRenderBands(c, id, dirty, left);
                 wlsPut(c, id, "dirty", dirty);
-                left -= (before - dirty.len()) * (st["cols"] as num) * (st["bandRows"] as num);
+                left -= wmCost(st["format"] as num, (before - dirty.len()) * (st["cols"] as num) * (st["bandRows"] as num));
             }
             if (dirty.len() == 0 && st["present"] as num == 1) {
                 wlsPut(c, id, "present", 0);
@@ -75,7 +95,7 @@ function wmRender(budget: num) {
     }
 }
 
-/** Renders bands from `dirty` until about `budget` glyphs are drawn; returns the bands still marked. */
+/** Renders bands from `dirty` until about `budget` units are spent; returns the bands still marked. */
 function wmRenderBands(c: num, id: num, dirty: list[num], budget: num): list[num] {
     line st: dict = global "s.o %var(c) %var(id)";
     line buf: num = st["buf"] as num;
@@ -105,8 +125,13 @@ function wmRenderBands(c: num, id: num, dirty: list[num], budget: num): list[num
         dirty.remove(1);
         line y0: num = (band - 1) * bandRows;
         line y1: num = num.min(band * bandRows, h) - 1;
-        wmSetText(uuids[band] as str, wmBandText(fd, first, stride, cols, y0, y1, glyphBase, opaque));
-        left -= cols * (y1 - y0 + 1);
+        if (format == p15Format()) {
+            // p15: offset is the buffer's first row in the pool.
+            wmSetText(uuids[band] as str, wmBandTextP15(fd, (b["offset"] as num) + 1, y0, y1));
+        } else {
+            wmSetText(uuids[band] as str, wmBandText(fd, first, stride, cols, y0, y1, glyphBase, opaque));
+        }
+        left -= wmCost(format, cols * (y1 - y0 + 1));
     }
     return dirty;
 }

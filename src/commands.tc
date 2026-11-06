@@ -8,12 +8,15 @@ function argNum(parts: list, index: num, fallback: num): num {
     return num.parse(parts[index] as str);
 }
 
-/** Pixel format from a command word: 1 for "332" or "rgb332", else 0 (argb8888). */
+/** Pixel format from a command word: 1 for "332" or "rgb332", 2 for "p15", else 0 (argb8888). */
 function argFormat(parts: list, index: num): num {
     if (parts.len() >= index) {
         line word: str = parts[index] as str;
         if (word == "332" || word == "rgb332") {
             return 1;
+        }
+        if (word == "p15") {
+            return 2;
         }
     }
     return 0;
@@ -54,6 +57,8 @@ playerevent command {
         }
     } else if (cmd == "wl") {
         wlCommand(parts);
+    } else if (cmd == "bench") {
+        benchCommand(parts);
     } else if (cmd == "key") {
         keyCommand(parts);
     } else if (cmd == "pack") {

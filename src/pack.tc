@@ -3,7 +3,7 @@
 
 /** The published pack (tools/build_pack.py --publish prints it). */
 function packUrl(): str {
-    return "https://raw.githubusercontent.com/HarryLarrious/tc-wayland_compositor/pack-dist/wl-pack-f1d27cad6a38.zip";
+    return "https://raw.githubusercontent.com/HarryLarrious/tc-wayland_compositor/pack-dist/wl-pack-91888127cc6a.zip";
 }
 
 /** Sends the pack to the player. */

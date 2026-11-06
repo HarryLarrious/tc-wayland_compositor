@@ -1,9 +1,10 @@
 // apps.tc: Wayland clients written in Terracotta. Each is a process that
 // talks to the compositor only through wlc.tc (and so the wire protocol).
 //   appInfo    prints the globals, like wayland-info
-//   appSimple  argb8888 window with a bouncing square, like weston-simple-shm
-//   appPaint   rgb332 canvas: click to paint, keys pick colors
-//   appTerm    rgb332 terminal with a tiny shell
+//   appSimple  window with a bouncing square, like weston-simple-shm
+//   appPaint   canvas: click to paint, keys pick colors
+//   appTerm    terminal with a tiny shell
+// The drawing apps use p15 buffers (font.tc), the fast path to the screen.
 
 /** Processes still to start: app names, read by the next app process (one per start). */
 declare global "app.queue": list[str];
@@ -53,6 +54,8 @@ process appInfo {
                 fname = "XRGB8888";
             } else if (f == 943867730) {
                 fname = "RGB332";
+            } else if (f == p15Format()) {
+                fname = "P15 (glyph rows)";
             }
             allPlayers.sendMessage(s"<gray>  wl_shm format: <white>%var(fname)");
         } else if (what == "wl_seat.capabilities") {
@@ -74,12 +77,12 @@ process appInfo {
     wlcClose(c);
 }
 
-/** Background pixel (x, y) of appSimple, as an argb8888 word. */
+/** Background color of appSimple at (x, y), 0xRRGGBB. */
 function simpleBg(x: num, y: num): num {
     line r: num = x * 4;
     line g: num = y * 5;
     line b: num = 128 + ((x ^ y) & 63);
-    return 4278190080 + (r << 16) + (g << 8) + b;
+    return (r << 16) + (g << 8) + b;
 }
 
 /** weston-simple-shm style: a gradient window with a bouncing square, redrawn on every frame callback. */
@@ -88,20 +91,25 @@ process appSimple {
     line c: num = wlcConnect("simple");
     line w: num = 64;
     line h: num = 48;
-    line win: dict = wlcWindow(c, "simple", w, h, 0);
+    line win: dict = wlcWindow(c, "simple", w, h, p15Format());
     line fd: num = win["fd"] as num;
-    line stride: num = win["stride"] as num;
+    // The background rows, kept to restore what the square covered.
+    line bg: list[str] = list.create() as list[str];
     repeat (line y to h) {
+        line row: list[str] = list.create() as list[str];
         repeat (line x to w) {
-            global "k.mem %var(fd)"[(y - 1) * stride + x] = simpleBg(x - 1, y - 1);
+            row.append(p15Color(simpleBg(x - 1, y - 1)));
         }
+        bg.append(row.join(""));
         cpuYield(30);
     }
+    global "k.mem %var(fd)" = bg;
+    line size: num = 8;
+    line square: str = p15Color(0xFFFFFF).repeat(size);
     line sx: num = 4;
     line sy: num = 4;
     line vx: num = 2;
     line vy: num = 1;
-    line size: num = 8;
     wlcPresent(c, win, [0, 0, w, h]);
     line ready: num = 0;
     line quit: num = 0;
@@ -116,14 +124,6 @@ process appSimple {
         }
         if (ready == 1 && quit == 0) {
             ready = 0;
-            // Put the background back where the square was, then draw it one step on.
-            repeat (line yy to size) {
-                repeat (line xx to size) {
-                    line px: num = sx + xx - 1;
-                    line py: num = sy + yy - 1;
-                    global "k.mem %var(fd)"[py * stride + px + 1] = simpleBg(px, py);
-                }
-            }
             line ox: num = sx;
             line oy: num = sy;
             sx += vx;
@@ -136,26 +136,20 @@ process appSimple {
                 vy = 0 - vy;
                 sy += 2 * vy;
             }
-            repeat (line yy to size) {
-                repeat (line xx to size) {
-                    global "k.mem %var(fd)"[(sy + yy - 1) * stride + sx + xx] = 4294967295;
-                }
+            // Rows the old square covered get their background back; the new
+            // square's rows are the background with the square spliced in.
+            repeat (line r to size) {
+                global "k.mem %var(fd)"[oy + r] = bg[oy + r];
             }
-            line dx: num = num.min(ox, sx);
+            repeat (line r to size) {
+                global "k.mem %var(fd)"[sy + r] = p15Splice(bg[sy + r] as str, sx, square);
+            }
             line dy: num = num.min(oy, sy);
-            wlcPresent(c, win, [dx, dy, num.abs(sx - ox) + size, num.abs(sy - oy) + size]);
+            wlcPresent(c, win, [0, dy, w, num.abs(sy - oy) + size]);
         }
         wait;
     }
     wlcClose(c);
-}
-
-/** Sets rgb332 pixel (x, y) of image fd (stride words per row) to color. */
-function px332(fd: num, stride: num, x: num, y: num, color: num) {
-    line idx: num = y * stride + num.floor(x / 4) + 1;
-    line k: num = x % 4;
-    line w: num = global "k.mem %var(fd)"[idx] as num;
-    global "k.mem %var(fd)"[idx] = w + (color - wlByte(w, k)) * 256 ** k;
 }
 
 /** Paint: left click paints a dot; keys 1-8 pick a color, p toggles the pen (paint as you look), c clears. */
@@ -164,15 +158,14 @@ process appPaint {
     line c: num = wlcConnect("paint");
     line w: num = 96;
     line h: num = 64;
-    line win: dict = wlcWindow(c, "paint", w, h, 943867730);
+    line win: dict = wlcWindow(c, "paint", w, h, p15Format());
     line fd: num = win["fd"] as num;
-    line stride: num = win["stride"] as num;
-    memFill(fd, stride, 0, 0, stride, h, 4294967295);
+    line white: str = p15Color(0xFFFFFF);
+    p15Fill(fd, 0, 0, w, h, white);
     wlcPresent(c, win, [0, 0, w, h]);
-    // black, red, green, blue, yellow, magenta, cyan, white
-    line palette: list[num] = [0, 224, 28, 3, 252, 227, 31, 255];
+    line colors: list[num] = [0x000000, 0xE02020, 0x20C020, 0x2040E0, 0xF0E020, 0xE020E0, 0x20E0E0, 0xFFFFFF];
     line names: list[str] = ["black", "red", "green", "blue", "yellow", "magenta", "cyan", "white"];
-    line color: num = 224;
+    line color: str = p15Color(0xE02020);
     line pen: num = 0;
     line mx: num = -1;
     line my: num = -1;
@@ -198,13 +191,13 @@ process appPaint {
             } else if (what == "wl_keyboard.key" && a[4] as num == 1) {
                 line ch: str = kbChar(a[3] as num, 0);
                 if (ch == "c") {
-                    memFill(fd, stride, 0, 0, stride, h, 4294967295);
+                    p15Fill(fd, 0, 0, w, h, white);
                     damage = [0, 0, w, h];
                 } else if (ch == "p") {
                     pen = 1 - pen;
                 } else if (ch != "" && "12345678".contains(ch)) {
                     line n: num = num.parse(ch);
-                    color = palette[n] as num;
+                    color = p15Color(colors[n] as num);
                     line cname: str = names[n] as str;
                     wlcReq(c, win["top"] as num, "set_title", ["paint: %var(cname)"]);
                 }
@@ -213,16 +206,14 @@ process appPaint {
             }
             if (dot == 1 && mx >= 0) {
                 // A 3 x 3 brush, clipped to the canvas.
-                repeat (line yy to 3) {
-                    repeat (line xx to 3) {
-                        line px: num = mx + xx - 2;
-                        line py: num = my + yy - 2;
-                        if (px >= 0 && px < w && py >= 0 && py < h) {
-                            px332(fd, stride, px, py, color);
-                        }
-                    }
+                line x0: num = num.max(0, mx - 1);
+                line y0: num = num.max(0, my - 1);
+                line x1: num = num.min(w - 1, mx + 1);
+                line y1: num = num.min(h - 1, my + 1);
+                if (x1 >= x0 && y1 >= y0) {
+                    p15Fill(fd, x0, y0, x1 - x0 + 1, y1 - y0 + 1, color);
+                    damage.append(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
                 }
-                damage.append(mx - 1, my - 1, 3, 3);
             }
         }
         if (damage.len() > 0) {
@@ -234,10 +225,13 @@ process appPaint {
     wlcClose(c);
 }
 
-/** Draws terminal row r (0-based) of text `line` (padded to 16 characters). */
-function termRow(fd: num, stride: num, r: num, text: str, nib: list[num]) {
+/** Draws terminal row r (0-based) of text (padded to 16 characters): 8 full pixel rows. */
+function termRow(fd: num, r: num, text: str, pat: list[str]) {
     line padded: str = text + "                ";
-    fontText(fd, stride, 0, r * 8, padded.trim(1, 16), nib);
+    line rows: list[str] = p15TextRows(padded.trim(1, 16), pat);
+    repeat (line i to 8) {
+        global "k.mem %var(fd)"[r * 8 + i] = rows[i];
+    }
 }
 
 /** A 16 x 12 character terminal with a tiny shell. */
@@ -247,11 +241,10 @@ process appTerm {
     line c: num = wlcConnect("term");
     line w: num = 128;
     line h: num = 96;
-    line win: dict = wlcWindow(c, "term", w, h, 943867730);
+    line win: dict = wlcWindow(c, "term", w, h, p15Format());
     line fd: num = win["fd"] as num;
-    line stride: num = win["stride"] as num;
-    // Light grey (6, 6, 3) on black.
-    line nib: list[num] = fontNibbles(219, 0);
+    // Light grey on near-black.
+    line pat: list[str] = p15Patterns(p15Color(0xD0D0C0), p15Color(0x101018));
     line rows: list[str] = ["tc-wayland term", "type help", ""];
     line input: str = "";
     line shift: num = 0;
@@ -316,16 +309,16 @@ process appTerm {
                     if (r <= screen.len()) {
                         text = screen[r] as str;
                     }
-                    termRow(fd, stride, r - 1, text, nib);
+                    termRow(fd, r - 1, text, pat);
                     cpuYield(30);
                 }
                 wlcPresent(c, win, [0, 0, w, h]);
             } else {
                 // Only the prompt rows changed.
                 line n: num = screen.len();
-                termRow(fd, stride, n - 1, screen[n] as str, nib);
+                termRow(fd, n - 1, screen[n] as str, pat);
                 if (n >= 2) {
-                    termRow(fd, stride, n - 2, screen[n - 1] as str, nib);
+                    termRow(fd, n - 2, screen[n - 1] as str, pat);
                 }
                 wlcPresent(c, win, [0, (num.max(1, n - 1) - 1) * 8, w, 16]);
             }

@@ -30,6 +30,7 @@ function pxPerBlock(): num {
 
 /** Fills the glyph and hex tables, once. */
 function pxInit {
+    btInit();
     if (!var.exists(global "px.hex")) {
         global "px.glyphs" = pxGlyphTable();
         global "px.hex" = pxHexTable();
@@ -64,8 +65,13 @@ function pxStart(fmt: num, width: num, height: num, bands: num, frames: num, eve
     line cols: num = num.round(width / perWord, mode="Ceiling");
     line w: num = cols * perWord;
     if (bands < 1) {
-        // About 512 glyphs per band keeps each band's MiniMessage near 8 KB.
-        bands = num.round(height / num.max(1, num.floor(512 / cols)), mode="Ceiling");
+        // About 512 glyphs per band keeps each band's MiniMessage near 8 KB. Tag-free
+        // p15 bands are plain text, so they fill DF's 10,000-character strings.
+        line perBand: num = 512;
+        if (fmt == 2) {
+            perBand = 9900;
+        }
+        bands = num.round(height / num.max(1, num.floor(perBand / cols)), mode="Ceiling");
     }
     line bandRows: num = num.round(height / bands, mode="Ceiling");
     bands = num.round(height / bandRows, mode="Ceiling");
@@ -103,6 +109,12 @@ function pxSpawn {
     line top: num = centre.y + height / pxPerBlock() / 2;
     // Glyph advance in font units: 10 per argb8888 word, 40 per rgb332 word.
     line lineWidth: num = (cfg["cols"] as num) * 10 * (1 + fmt * 3) + 10;
+    // A p15 glyph is 2 font units wide, so its displays stretch 5x horizontally.
+    line scaleX: num = 0.25;
+    if (fmt == 2) {
+        lineWidth = (cfg["cols"] as num) * 2 + 10;
+        scaleX = 1.25;
+    }
     line cullW: num = (cfg["width"] as num) / pxPerBlock() + 1;
     line cullH: num = bandRows / pxPerBlock() + 1;
     line uuids: list[str] = list.create() as list[str];
@@ -113,7 +125,7 @@ function pxSpawn {
         p.y = top - r1 / pxPerBlock();
         game.spawnTextDisplay(p, s" ");
         lastEntity.setDisplayBillboard(type="Vertical");
-        lastEntity.setDisplayScale(0.25, 0.25, 0.25);
+        lastEntity.setDisplayScale(scaleX, 0.25, 0.25);
         lastEntity.setTextDisplayLineWidth(lineWidth);
         lastEntity.setTextDisplayTextAlignment(align="Left");
         lastEntity.setTextDisplayBackground("#000000", 0);
@@ -147,6 +159,20 @@ function pxBandText(words: list[num], cols: num, glyphBase: num): str {
     return "<font:wl:px>" + rows.join("<br>");
 }
 
+/** Plain text for one band of p15 values (0-32767): one wl:p15 glyph per pixel, rows split by newlines. */
+function pxBandTextP15(vals: list[num], cols: num): str {
+    line rows: list[str] = list.create() as list[str];
+    line row: list[str] = list.create() as list[str];
+    for (line v of vals) {
+        row.append(bt15(v as num));
+        if (row.len() == cols) {
+            rows.append(row.join(""));
+            row = list.create() as list[str];
+        }
+    }
+    return "<font:wl:p15>" + rows.join("\n");
+}
+
 /** Sets every band's text to frame f. */
 function pxDraw(f: num) {
     line cfg: dict = global "px.cfg";
@@ -156,7 +182,12 @@ function pxDraw(f: num) {
     repeat (line b to uuids.len()) {
         line words: list[num] = global "px.f %var(f) %var(b)";
         line t0: num = game.microsecondsSinceStartup;
-        line text: str = pxBandText(words, cols, glyphBase);
+        line text: str = "";
+        if (cfg["fmt"] as num == 2) {
+            text = pxBandTextP15(words, cols);
+        } else {
+            text = pxBandText(words, cols, glyphBase);
+        }
         global "px.usBuild" += game.microsecondsSinceStartup - t0;
         select entitiesByUUID(uuids[b] as str);
         selectedEntity.setTextDisplayText(txt.parseExpression(text, allowed="Full"));
@@ -178,6 +209,8 @@ process pxRun {
     line fmtName: str = "argb8888";
     if (cfg["fmt"] as num == 1) {
         fmtName = "rgb332";
+    } else if (cfg["fmt"] as num == 2) {
+        fmtName = "p15";
     }
     line width: num = cfg["width"] as num;
     line height: num = cfg["height"] as num;
@@ -287,7 +320,18 @@ function pxPaint(f: num, still: num) {
             line y: num = y0 + yi - 1;
             repeat (line c to cols) {
                 line word: num = 0;
-                if (fmt == 0) {
+                if (fmt == 2) {
+                    // rgb555, one tag-free glyph per pixel; cut-out pixels are black.
+                    line col: num = 0;
+                    if (still) {
+                        col = pxCardColor(c - 1, y, width, height);
+                    } else {
+                        col = pxAnimColor(c - 1, y, f, width, height, frames);
+                    }
+                    if (col > 0) {
+                        word = ((col >> 19) & 31) * 1024 + ((col >> 11) & 31) * 32 + ((col >> 3) & 31);
+                    }
+                } else if (fmt == 0) {
                     line x: num = c - 1;
                     line col: num = 0;
                     if (still) {

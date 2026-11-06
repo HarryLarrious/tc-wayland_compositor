@@ -150,7 +150,8 @@ function wlcBind(c: num, iface: str, version: num): num {
 /**
  * Opens a toplevel window of w x h pixels in wl_shm format `format` and
  * waits for its first configure. Returns its objects and buffer:
- * {surface, xdg, top, buf, fd, stride (words per row), pointer, keyboard}.
+ * {surface, xdg, top, buf, fd, stride (words per row; glyphs for p15),
+ * pointer, keyboard}. Draw p15 windows with font.tc's p15 functions.
  */
 function wlcWindow(c: num, title: str, w: num, h: num, format: num): dict {
     wlcRoundtrip(c);
@@ -167,12 +168,20 @@ function wlcWindow(c: num, title: str, w: num, h: num, format: num): dict {
     wlcReq(c, top, "set_title", [title]);
     wlcReq(c, top, "set_app_id", [title]);
     wlcReq(c, surf, "commit", list.create());
-    // Shared memory: rgb332 rows are padded to whole words.
+    // Shared memory: rgb332 rows are padded to whole words. A p15 pool holds
+    // one glyph string per row (black to start); stride and size count glyphs.
     line stride: num = w * 4;
     if (format == 943867730) {
         stride = num.round(w / 4, mode="Ceiling") * 4;
     }
-    line fd: num = kMemCreate(stride * h);
+    line fd: num = 0;
+    if (format == p15Format()) {
+        fontInit();
+        stride = w;
+        fd = p15Create(w, h, p15Color(0));
+    } else {
+        fd = kMemCreate(stride * h);
+    }
     line pool: num = wlcNew(c, "wl_shm_pool");
     wlcReqFd(c, shm, "create_pool", [pool, fd, stride * h], [fd]);
     line buf: num = wlcNew(c, "wl_buffer");
@@ -201,7 +210,10 @@ function wlcWindow(c: num, title: str, w: num, h: num, format: num): dict {
         }
     }
     global "cl.backlog %var(c)" = keep;
-    return {surface: surf, xdg: xs, top: top, buf: buf, fd: fd, stride: stride / 4, w: w, h: h, pointer: ptr, keyboard: kb};
+    if (format != p15Format()) {
+        stride = stride / 4;
+    }
+    return {surface: surf, xdg: xs, top: top, buf: buf, fd: fd, stride: stride, w: w, h: h, pointer: ptr, keyboard: kb};
 }
 
 /** Attaches the window's buffer with damage [x, y, w, h, ...], asks for a frame callback (cl.frame) and commits. */

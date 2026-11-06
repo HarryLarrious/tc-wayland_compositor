@@ -9,6 +9,11 @@
 //   0 argb8888: one pixel; alpha below 128 is cut out
 //   1 rgb332:   four pixels; sub-pixel s (left to right) is byte s of the
 //               word, as a little-endian buffer stores them
+//
+// Tag-free glyphs (font wl:p15) carry 15 bits in the glyph alone, so text
+// needs no color tags:
+//   glyph texel: red = v & 255, green = v >> 8 (0-127), blue = 0xB0 | format
+//   format 0 rgb555: one pixel, red in bits 10-14
 
 const int WL_PX_MARK = 0xC3;
 const int WL_PX_ARGB8888 = 0;
@@ -18,6 +23,11 @@ const int WL_PX_RGB332 = 1;
 // color. Sets marked to false for any other glyph; the result is then unused.
 vec4 wl_px_decode(vec4 texel, vec4 rawColor, out bool marked) {
     ivec3 t = ivec3(round(texel.rgb * 255.0));
+    if ((t.b & 0xF0) == 0xB0 && t.g < 128) {
+        marked = true;
+        uint v = uint(t.r) | uint(t.g) << 8;
+        return vec4(vec3((v >> 10) & 31u, (v >> 5) & 31u, v & 31u) / 31.0, 1.0);
+    }
     marked = t.g == WL_PX_MARK && (t.b & 0xF0) == 0xA0;
     if (!marked) {
         return vec4(0.0);

@@ -1,0 +1,588 @@
+// bench.tc: measures how much DF time each way of encoding pixel data into
+// text-display text costs per payload bit (@bench). The pack is not needed:
+// DF's cost does not depend on whether the client has the glyphs.
+//
+// Encodings (bits of payload per glyph):
+//   tag32     <c:#rrggbb>G</c>, G one of 256 glyphs            32
+//   tag40     the same with G one of 65,536 glyphs              40
+//   legacy32  legacy hex color codes before each glyph          32
+//   plain8    glyph only, 256 glyphs                             8
+//   plain16   glyph only, 65,536 glyphs                         16
+//   join16    plain16 already stored as glyph strings (the client wrote them)
+// Setting the text:
+//   parse     MiniMessage parse (Full) inside <font:wl:px>
+//   raw       the plain string as the text, no parse (glyphs in the default font)
+// Each line printed: BENCH <test> n=<glyphs> build=<us/glyph> set=<us/glyph>
+// total=<us/glyph> bits=<bits/glyph> mbps=<Mbit/s at half the plot's CPU>.
+
+/** 16-bit glyph tables: 16 strings of 4096 glyphs (supplementary-plane PUA, two UTF-16 units each). */
+declare global "bt.s16 %var(k)": str;
+/** String positions one 16-bit glyph takes: 2 if DF counts UTF-16 units, 1 if it counts code points. */
+declare global "bt.w": num;
+/** 13-bit glyph table: 8192 one-glyph strings, at index value + 1. */
+declare global "bt.lut13": list[str];
+/** Legacy color prefixes "&h&h" for 0-255, at index value + 1. */
+declare global "bt.leg": list[str];
+/** The benchmark display's UUID. */
+declare global "bt.uid": str;
+/** The probe display's UUID (each probe replaces it). */
+declare global "bt.probe": str;
+/** Tests still to run: [name, glyphs, reps]. */
+declare global "bt.queue": list;
+
+/** Fills the benchmark tables, once. */
+function btInit {
+    // The px tables (pxInit calls this function, so they are filled here directly).
+    if (!var.exists(global "px.hex")) {
+        global "px.glyphs" = pxGlyphTable();
+        global "px.hex" = pxHexTable();
+    }
+    if (var.exists(global "bt.lut13")) {
+        return;
+    }
+    // Content does not change DF's cost, so one repeated glyph stands in for the real table.
+    line seed: str = "󰁁";
+    repeat (line k to 16) {
+        line chunk: num = k - 1;
+        global "bt.s16 %var(chunk)" = seed.repeat(4096);
+    }
+    global "bt.w" = (global "bt.s16 0" as str).len() / 4096;
+    line width: num = global "bt.w";
+    allPlayers.sendMessage("BENCH info: a supplementary glyph is %var(width) string positions");
+    line hexDigits: str = "0123456789abcdef";
+    line leg: list[str] = list.create() as list[str];
+    repeat (line i to 256) {
+        line v: num = i - 1;
+        line hi: str = hexDigits.trim((v >> 4) + 1, (v >> 4) + 1);
+        line lo: str = hexDigits.trim((v & 15) + 1, (v & 15) + 1);
+        leg.append("&%var(hi)&%var(lo)");
+    }
+    global "bt.leg" = leg;
+    fontInit();
+    line lut: list[str] = list.create() as list[str];
+    repeat (line i to 8192) {
+        line half: num = num.floor((i - 1) / 4096);
+        line pos: num = (i - 1) % 4096 + 1;
+        lut.append((global "p15.s %var(half)" as str).trim(pos, pos));
+        cpuYield(50);
+    }
+    global "bt.lut13" = lut;
+}
+
+/** The 15-bit glyph for value v (0-32767): the wl:p15 glyph. */
+function bt15(v: num): str {
+    return p15Glyph(v);
+}
+
+/** lut13: one static list lookup per 13-bit value. */
+function btLut13(vals: list[num]): str {
+    line row: list[str] = list.create() as list[str];
+    for (line v of vals) {
+        row.append(global "bt.lut13"[(v as num) + 1] as str);
+    }
+    return row.join("");
+}
+
+/** str15: one chunk-string lookup per 15-bit value. */
+function btLookup15(vals: list[num]): str {
+    line row: list[str] = list.create() as list[str];
+    for (line v of vals) {
+        row.append(bt15(v as num));
+    }
+    return row.join("");
+}
+
+/** Parses each string, joins the styled texts and sets them as one display text. */
+function btSetMulti(texts: list[str]) {
+    line parts: list[txt] = list.create() as list[txt];
+    for (line t of texts) {
+        parts.append(txt.parseExpression(t as str, allowed="Full"));
+    }
+    select entitiesByUUID(global "bt.uid");
+    selectedEntity.setTextDisplayText(parts.joinStyled());
+    select reset;
+}
+
+/** The 16-bit glyph for value v (0-65535). */
+function bt16(v: num): str {
+    line idx: num = v % 4096;
+    line chunk: num = (v - idx) / 4096;
+    line w: num = global "bt.w";
+    return (global "bt.s16 %var(chunk)" as str).trim(idx * w + 1, idx * w + w);
+}
+
+/** tag32: one <c:#rrggbb>G</c> per 32-bit word. */
+function btTag32(words: list[num]): str {
+    line row: list[str] = list.create() as list[str];
+    for (line w of words) {
+        line wn: num = w as num;
+        line low: num = wn % 16777216;
+        line gl: str = global "px.glyphs"[(wn - low) / 16777216 + 1] as str;
+        line hr: str = global "px.hex"[(low >> 16) + 1] as str;
+        line hg: str = global "px.hex"[((low >> 8) & 255) + 1] as str;
+        line hb: str = global "px.hex"[(low & 255) + 1] as str;
+        row.append("<c:#%var(hr)%var(hg)%var(hb)>%var(gl)</c>");
+    }
+    return "<font:wl:px>" + row.join("");
+}
+
+/** tag40: a 24-bit color and a 16-bit glyph per item; words hold the color, glyphs the 16-bit values. */
+function btTag40(words: list[num], glyphs: list[num]): str {
+    line row: list[str] = list.create() as list[str];
+    repeat (line i to words.len()) {
+        line low: num = (words[i] as num) % 16777216;
+        line gl: str = bt16(glyphs[i] as num);
+        line hr: str = global "px.hex"[(low >> 16) + 1] as str;
+        line hg: str = global "px.hex"[((low >> 8) & 255) + 1] as str;
+        line hb: str = global "px.hex"[(low & 255) + 1] as str;
+        row.append("<c:#%var(hr)%var(hg)%var(hb)>%var(gl)</c>");
+    }
+    return "<font:wl:px>" + row.join("");
+}
+
+/** legacy32: &x&r&r&g&g&b&b before each glyph. */
+function btLegacy(words: list[num]): str {
+    line row: list[str] = list.create() as list[str];
+    for (line w of words) {
+        line wn: num = w as num;
+        line low: num = wn % 16777216;
+        line gl: str = global "px.glyphs"[(wn - low) / 16777216 + 1] as str;
+        line lr: str = global "bt.leg"[(low >> 16) + 1] as str;
+        line lg: str = global "bt.leg"[((low >> 8) & 255) + 1] as str;
+        line lb: str = global "bt.leg"[(low & 255) + 1] as str;
+        row.append("&x%var(lr)%var(lg)%var(lb)%var(gl)");
+    }
+    return "<font:wl:px>" + row.join("");
+}
+
+/** plain8: one of 256 glyphs per byte. */
+function btPlain8(bytes: list[num]): str {
+    line row: list[str] = list.create() as list[str];
+    for (line b of bytes) {
+        row.append(global "px.glyphs"[(b as num) + 1] as str);
+    }
+    return row.join("");
+}
+
+/** plain16: one of 65,536 glyphs per 16-bit value. */
+function btPlain16(vals: list[num]): str {
+    line row: list[str] = list.create() as list[str];
+    for (line v of vals) {
+        row.append(bt16(v as num));
+    }
+    return row.join("");
+}
+
+/** Sets the benchmark display's text: parsed as MiniMessage (mode "parse" or "legacy") or as the raw string. */
+function btSet(text: str, mode: str) {
+    select entitiesByUUID(global "bt.uid");
+    if (mode == "raw") {
+        // DF turns a plain string into unstyled text: no MiniMessage parse.
+        selectedEntity.setTextDisplayText(text as txt);
+    } else if (mode == "legacy") {
+        selectedEntity.setTextDisplayText(txt.parseExpression(text, allowed="Full", parseLegacyColors="True"));
+    } else {
+        selectedEntity.setTextDisplayText(txt.parseExpression(text, allowed="Full"));
+    }
+    select reset;
+}
+
+/** Times one test: `reps` rounds of build + set over n glyphs, then prints its BENCH line. */
+function btRun(name: str, n: num, reps: num) {
+    // Random payload, prepared before timing.
+    line words: list[num] = list.create() as list[num];
+    line vals: list[num] = list.create() as list[num];
+    line bytes: list[num] = list.create() as list[num];
+    repeat (n) {
+        words.append(num.random(0, 255) * 16777216 + num.random(0, 16777215));
+        vals.append(num.random(0, 65535));
+        bytes.append(num.random(0, 255));
+    }
+    line kind: str = name.split("-")[1] as str;
+    line v13: list[num] = list.create() as list[num];
+    line v15: list[num] = list.create() as list[num];
+    repeat (n) {
+        v13.append(num.random(0, 8191));
+        v15.append(num.random(0, 32767));
+    }
+    line premade: list[str] = list.create() as list[str];
+    if (kind == "join16") {
+        for (line v of vals) {
+            premade.append(bt16(v as num));
+        }
+    } else if (kind == "join15" || kind == "multi") {
+        for (line v of v15) {
+            premade.append(bt15(v as num));
+        }
+    } else if (kind == "rows15") {
+        // Whole rows of 128 glyphs, as a client that keeps row strings would.
+        line row: list[str] = list.create() as list[str];
+        for (line v of v15) {
+            row.append(bt15(v as num));
+            if (row.len() == 128) {
+                premade.append(row.join(""));
+                row = list.create() as list[str];
+            }
+        }
+        if (row.len() > 0) {
+            premade.append(row.join(""));
+        }
+    }
+    line bits: num = 32;
+    if (kind == "tag40") {
+        bits = 40;
+    } else if (kind == "plain8") {
+        bits = 8;
+    } else if (kind == "lut13") {
+        bits = 13;
+    } else if (kind == "str15" || kind == "join15" || kind == "rows15" || kind == "multi") {
+        bits = 15;
+    } else if (kind != "tag32" && kind != "legacy32") {
+        bits = 16;
+    }
+    line mode: str = "parse";
+    if (kind == "legacy32") {
+        mode = "legacy";
+    } else if (name.endsWith("-raw")) {
+        mode = "raw";
+    }
+    line chars: num = 0;
+    line buildUs: num = 0;
+    line setUs: num = 0;
+    repeat (reps) {
+        line t0: num = game.microsecondsSinceStartup;
+        line text: str = "";
+        if (name == "tag32") {
+            text = btTag32(words);
+        } else if (name == "tag40") {
+            text = btTag40(words, vals);
+        } else if (name == "legacy32") {
+            text = btLegacy(words);
+        } else if (name == "plain8-parse") {
+            text = "<font:wl:px>" + btPlain8(bytes);
+        } else if (name == "plain8-raw") {
+            text = btPlain8(bytes);
+        } else if (name == "plain16-parse") {
+            text = "<font:wl:px>" + btPlain16(vals);
+        } else if (name == "plain16-raw") {
+            text = btPlain16(vals);
+        } else if (name == "join16-parse") {
+            text = "<font:wl:px>" + premade.join("");
+        } else if (name == "join16-raw") {
+            text = premade.join("");
+        } else if (kind == "lut13") {
+            text = btLut13(v13);
+        } else if (kind == "str15") {
+            text = btLookup15(v15);
+        } else if (kind == "join15") {
+            text = premade.join("");
+        } else if (kind == "rows15") {
+            text = premade.join("\n");
+        }
+        if (mode == "parse" && kind != "tag32" && kind != "tag40" && kind != "legacy32" && kind != "plain8" && kind != "plain16" && kind != "join16" && kind != "multi") {
+            text = "<font:wl:px>" + text;
+        }
+        // multi: strings of up to 9984 glyphs, parsed and joined as styled text.
+        line chunks: list[str] = list.create() as list[str];
+        if (kind == "multi") {
+            line at: num = 1;
+            while (at <= n) {
+                chunks.append("<font:wl:px>" + premade.trim(at, num.min(at + 9983, n)).join(""));
+                at += 9984;
+            }
+        }
+        chars = num.max(chars, text.len());
+        line t1: num = game.microsecondsSinceStartup;
+        if (kind == "multi") {
+            btSetMulti(chunks);
+        } else {
+            btSet(text, mode);
+        }
+        line t2: num = game.microsecondsSinceStartup;
+        buildUs += t1 - t0;
+        setUs += t2 - t1;
+        wait(2);
+    }
+    line build: num = num.round(buildUs / reps / n * 100) / 100;
+    line set: num = num.round(setUs / reps / n * 100) / 100;
+    line total: num = num.round((buildUs + setUs) / reps / n * 100) / 100;
+    // Half the plot's CPU is 500,000 us per second.
+    line mbps: num = num.round(500000 / ((buildUs + setUs) / reps / n) * bits / 10000) / 100;
+    allPlayers.sendMessage("BENCH %var(name) n=%var(n) chars=%var(chars) build=%var(build) set=%var(set) total=%var(total) bits=%var(bits) mbps=%var(mbps)");
+}
+
+/** Runs every queued test, one after another. */
+process btProcess {
+    btInit();
+    // The display sits under the player's feet, out of the way.
+    game.spawnTextDisplay(default.location + vec(0, -3, 0), s" ");
+    lastEntity.setTextDisplayLineWidth(1000000);
+    global "bt.uid" = lastEntity.uuid;
+    while (global "bt.queue".len() > 0) {
+        line t: list = global "bt.queue"[1] as list;
+        global "bt.queue".remove(1);
+        btRun(t[1] as str, t[2] as num, t[3] as num);
+        wait(5);
+    }
+    select entitiesByUUID(global "bt.uid");
+    selectedEntity.remove();
+    select reset;
+    allPlayers.sendMessage("BENCH DONE");
+}
+
+/** @bench [test]: queues one test, or the whole matrix, and runs it. */
+function benchCommand(parts: list) {
+    line q: list = list.create();
+    if (parts.len() >= 3 && parts[2] as str == "stress") {
+        line mode: str = "raw";
+        if (parts.len() >= 4) {
+            mode = parts[4] as str;
+        }
+        global "bt.queue" = [argNum(parts, 3, 1), mode, argNum(parts, 5, 1), argNum(parts, 6, 76)];
+        start btStress;
+        return;
+    }
+    if (parts.len() >= 2 && parts[2] as str == "clear") {
+        // Removes the last probe display and stops a stress run.
+        global "bt.stress" += 1;
+        if (var.exists(global "bt.probe")) {
+            select entitiesByUUID(global "bt.probe");
+            selectedEntity.remove();
+            select reset;
+        }
+        return;
+    }
+    if (parts.len() >= 3 && parts[2] as str == "probe") {
+        btProbe(parts[3] as str, argNum(parts, 4, 512));
+        return;
+    }
+    if (parts.len() >= 2) {
+        q.append([parts[2] as str, argNum(parts, 3, 2048), argNum(parts, 4, 10)]);
+    } else {
+        // Round 2: every text stays under DF's 10,000-character string limit.
+        q.append(["tag32", 512, 10]);
+        q.append(["legacy32", 512, 10]);
+        q.append(["plain8-raw", 8192, 5]);
+        for (line name of ["lut13-parse", "lut13-raw", "str15-parse", "str15-raw", "join15-parse", "join15-raw"]) {
+            q.append([name, 4096, 10]);
+            q.append([name, 9984, 5]);
+        }
+        q.append(["rows15-parse", 9984, 5]);
+        q.append(["rows15-raw", 9984, 5]);
+        q.append(["multi-parse", 39936, 5]);
+    }
+    global "bt.queue" = q;
+    start btProcess;
+}
+
+/**
+ * @bench probe <test> <glyphs>: builds one text with a visible END at its end,
+ * prints its string length and parsed length (0 means the parse failed), and
+ * shows it on a display in front of the player, to see whether DF set it.
+ */
+function btProbe(name: str, n: num) {
+    btInit();
+    line words: list[num] = list.create() as list[num];
+    line vals: list[num] = list.create() as list[num];
+    repeat (n) {
+        words.append(4278190080 + num.random(0, 16777215));
+        vals.append(num.random(0, 65535));
+    }
+    line text: str = "";
+    if (name == "tag32") {
+        text = btTag32(words) + "<reset>END";
+    } else if (name == "legacy32") {
+        text = btLegacy(words) + "&rEND";
+    } else if (name == "plain8") {
+        text = btPlain8(vals.trim(1, n)) + "END";
+    } else if (name == "rows15") {
+        // Rows of 128 glyphs joined with newlines, as a client keeping row strings would send them.
+        line rows: list[str] = list.create() as list[str];
+        line row: list[str] = list.create() as list[str];
+        for (line v of vals) {
+            row.append(bt15((v as num) & 32767));
+            if (row.len() == 128) {
+                rows.append(row.join(""));
+                row = list.create() as list[str];
+            }
+        }
+        rows.append("END");
+        text = rows.join("\n");
+    } else if (name != "multi") {
+        text = btPlain16(vals) + "END";
+    }
+    line strLen: num = text.len();
+    line parsed: txt = txt.parseExpression(text, allowed="Full", parseLegacyColors="True");
+    if (name == "multi") {
+        // Strings of 9984 glyphs, each parsed, then joined as styled text.
+        line parts: list[txt] = list.create() as list[txt];
+        line glyphs: list[str] = list.create() as list[str];
+        for (line v of vals) {
+            glyphs.append(bt15((v as num) & 32767));
+            if (glyphs.len() == 9984) {
+                parts.append(txt.parseExpression(glyphs.join(""), allowed="Full"));
+                glyphs = list.create() as list[str];
+            }
+        }
+        parts.append(txt.parseExpression(glyphs.join("") + "END", allowed="Full"));
+        parsed = parts.joinStyled();
+    }
+    line parsedLen: num = parsed.len();
+    default.sendMessage("PROBE %var(name) n=%var(n) chars=%var(strLen) parsed=%var(parsedLen)");
+    line forward: vec = default.direction;
+    forward.y = 0;
+    forward = forward.setLength(1);
+    if (var.exists(global "bt.probe")) {
+        select entitiesByUUID(global "bt.probe");
+        selectedEntity.remove();
+        select reset;
+    }
+    game.spawnTextDisplay(default.eyeLocation + forward * 3, parsed);
+    global "bt.probe" = lastEntity.uuid;
+    lastEntity.setTextDisplayLineWidth(4000);
+    lastEntity.setDisplayScale(0.05, 0.05, 0.05);
+    lastEntity.setDisplayBillboard(type="Center");
+}
+
+/** Stress test state: run id, so @bench stress stop (or a new run) ends the old one. */
+declare global "bt.stress": num;
+
+/**
+ * @bench stress <displays> [mode] [every] [rows]: rewrites `displays` displays
+ * of `rows` x 128 15-bit glyphs every `every` ticks (0: set once, then static)
+ * for 10 seconds, alternating two pre-made texts so every set is a change.
+ * mode "raw" (default font) or "parse" (<font:wl:px>).
+ * Prints the DF time per tick and the payload rate.
+ */
+process btStress {
+    btInit();
+    global "bt.stress" += 1;
+    line run: num = global "bt.stress";
+    line cfg: list = global "bt.queue";
+    line k: num = cfg[1] as num;
+    line mode: str = cfg[2] as str;
+    line every: num = cfg[3] as num;
+    line rowCount: num = cfg[4] as num;
+    // Two pre-made texts of `rows` rows of 128 glyphs. plainpx: px glyphs, no tags.
+    // tagpx: rows of tagged px glyphs, parsed once here (as a client would when a
+    // row changes) and only joined as styled text per set.
+    line texts: list[str] = list.create() as list[str];
+    line styled: list = list.create();
+    if (mode == "plainpx" || mode == "tagpx") {
+        repeat (2) {
+            line rows: list[str] = list.create() as list[str];
+            line rowsTxt: list[txt] = list.create() as list[txt];
+            repeat (line r to rowCount) {
+                line row: list[str] = list.create() as list[str];
+                repeat (128) {
+                    line g: str = global "px.glyphs"[num.random(1, 512)] as str;
+                    if (mode == "tagpx") {
+                        line hr: str = global "px.hex"[num.random(1, 256)] as str;
+                        line hg: str = global "px.hex"[num.random(1, 256)] as str;
+                        line hb: str = global "px.hex"[num.random(1, 256)] as str;
+                        row.append("<c:#%var(hr)%var(hg)%var(hb)>%var(g)</c>");
+                    } else {
+                        row.append(g);
+                    }
+                }
+                line rowText: str = row.join("");
+                rows.append(rowText);
+                if (mode == "tagpx") {
+                    if (r < rowCount) {
+                        rowText = rowText + "<br>";
+                    }
+                    rowsTxt.append(txt.parseExpression("<font:wl:px>" + rowText, allowed="Full"));
+                }
+                // One row per tick: parsing tags in bulk trips DF's LagSlayer.
+                wait;
+            }
+            texts.append("<font:wl:px>" + rows.join("\n"));
+            styled.append(rowsTxt);
+        }
+    }
+    repeat (2) {
+        if (mode == "plainpx" || mode == "tagpx") {
+            break;
+        }
+        line rows: list[str] = list.create() as list[str];
+        repeat (rowCount) {
+            line row: list[str] = list.create() as list[str];
+            repeat (128) {
+                row.append(bt15(num.random(0, 32767)));
+            }
+            rows.append(row.join(""));
+            cpuYield(50);
+        }
+        line text: str = rows.join("\n");
+        if (mode == "parse") {
+            text = "<font:wl:px>" + text;
+        } else if (mode == "p15") {
+            text = "<font:wl:p15>" + text;
+        }
+        texts.append(text);
+    }
+    line forward: vec = default.direction;
+    forward.y = 0;
+    forward = forward.setLength(1);
+    line right: vec = vec(0 - forward.z, 0, forward.x);
+    line uuids: list[str] = list.create() as list[str];
+    repeat (line i to k) {
+        game.spawnTextDisplay(default.eyeLocation + forward * 8 + right * ((i - (k + 1) / 2) * 3), s" ");
+        lastEntity.setTextDisplayLineWidth(100000);
+        if (mode == "p15") {
+            // p15 glyphs are 2 x 10 font units: stretch x for square pixels.
+            lastEntity.setDisplayScale(0.25, 0.05, 0.05);
+        } else {
+            lastEntity.setDisplayScale(0.1, 0.1, 0.1);
+        }
+        lastEntity.setTextDisplayBackground("#000000", 0);
+        lastEntity.setTextDisplayTextShadow(textShadow="Disable");
+        lastEntity.setDisplayBillboard(type="Center");
+        uuids.append(lastEntity.uuid);
+    }
+    line spent: num = 0;
+    line ticks: num = 0;
+    repeat (line t to 200) {
+        if (global "bt.stress" != run) {
+            break;
+        }
+        line t0: num = game.microsecondsSinceStartup;
+        line text: str = texts[t % 2 + 1] as str;
+        line due: num = 0;
+        if (every == 0 && t == 1) {
+            due = 1;
+        } else if (every > 0 && t % every == 0) {
+            due = 1;
+        }
+        if (due == 0) {
+            uuids = uuids;
+        } else {
+        for (line uid of uuids) {
+            select entitiesByUUID(uid as str);
+            if (mode == "parse" || mode == "plainpx" || mode == "p15") {
+                selectedEntity.setTextDisplayText(txt.parseExpression(text, allowed="Full"));
+            } else if (mode == "tagpx") {
+                selectedEntity.setTextDisplayText((styled[t % 2 + 1] as list[txt]).joinStyled());
+            } else {
+                selectedEntity.setTextDisplayText(text as txt);
+            }
+            select reset;
+        }
+        }
+        spent += game.microsecondsSinceStartup - t0;
+        ticks += 1;
+        wait;
+    }
+    for (line uid of uuids) {
+        select entitiesByUUID(uid as str);
+        selectedEntity.remove();
+        select reset;
+    }
+    line usTick: num = num.round(spent / ticks);
+    line mbit: num = 0;
+    if (every > 0) {
+        mbit = num.round(k * rowCount * 128 * 15 * 20 / every / 100000) / 10;
+    }
+    line cpu: num = game.cpuUsage;
+    allPlayers.sendMessage("STRESS displays=%var(k) mode=%var(mode) every=%var(every) rows=%var(rowCount) us/tick=%var(usTick) payload=%var(mbit) Mbit/s cpu=%var(cpu)");
+}

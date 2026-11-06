@@ -2,7 +2,7 @@
 // who ran @wl start: global "s.wall" holds its top-left corner (o), its right
 // direction (r) and its normal toward the player (n). Wall pixels are 1/16
 // block, x right and y down from the corner. Each window has a title bar
-// (decoration) 10 pixels tall above it, drawn by the compositor.
+// (decoration) 10 pixels tall above it, a p15 image the compositor draws.
 //
 // The player's crosshair is the pointer: each tick wmInput casts the look
 // ray onto the wall. Left and right clicks are buttons; chat lines are typed
@@ -130,9 +130,15 @@ function wmShow(c: num, id: num, damage: list) {
         line cols: num = num.round(w / perWord, mode="Ceiling");
         st["cols"] = cols;
         st["perWord"] = perWord;
-        st["bandRows"] = num.max(1, num.floor(512 / cols));
+        // Tagged bands stay near 512 glyphs (8 KB of MiniMessage). p15 bands are
+        // about 1024 glyphs: every change re-sends its whole band, and the client
+        // re-processes each glyph sent (README, Data path benchmarks).
+        line perBand: num = 512;
+        if (format == p15Format()) {
+            perBand = 1024;
+        }
+        st["bandRows"] = num.max(1, num.floor(perBand / cols));
         st["bands"] = num.round(h / (st["bandRows"] as num), mode="Ceiling");
-        st["decoCols"] = num.round(w / 4, mode="Ceiling");
         global "s.o %var(c) %var(id)" = st;
         wmCreateDisplays(c, id);
         fresh = 1;
@@ -175,26 +181,38 @@ function wmCreateDisplays(c: num, id: num) {
     line w: num = st["w"] as num;
     line bandRows: num = st["bandRows"] as num;
     line uuids: list[str] = list.create() as list[str];
+    line p15: num = 0;
+    if (st["format"] as num == p15Format()) {
+        p15 = 1;
+    }
     repeat (line b to st["bands"] as num) {
         game.spawnTextDisplay(wmWallLoc(0, 0, 0), s" ");
-        wmSetupDisplay(cols * 10 * (st["perWord"] as num) + 10, w, bandRows);
+        if (p15 == 1) {
+            wmSetupDisplay(cols * 2 + 10, w, bandRows, 1);
+        } else {
+            wmSetupDisplay(cols * 10 * (st["perWord"] as num) + 10, w, bandRows, 0);
+        }
         uuids.append(lastEntity.uuid);
     }
     game.spawnTextDisplay(wmWallLoc(0, 0, 0), s" ");
-    wmSetupDisplay((st["decoCols"] as num) * 40 + 10, w, wmDecoH());
+    wmSetupDisplay(w * 2 + 10, w, wmDecoH(), 1);
     wlsPut(c, id, "displays", uuids);
     wlsPut(c, id, "deco", lastEntity.uuid);
-    // The title bar is a small rgb332 buffer the compositor draws itself.
-    line decoFd: num = kMemCreate((st["decoCols"] as num) * 4 * wmDecoH());
+    // The title bar is a small p15 image the compositor draws itself.
+    line decoFd: num = p15Create(w, wmDecoH(), p15Color(0));
     wlsPut(c, id, "decoFd", decoFd);
     wmDrawDeco(c, id);
     wmPlace(c, id);
 }
 
-/** Sets up the display just spawned (lastEntity) as a pixel band. */
-function wmSetupDisplay(lineWidth: num, w: num, rows: num) {
+/** Sets up the display just spawned (lastEntity) as a pixel band; p15 bands (2-unit glyphs) stretch 5x in x. */
+function wmSetupDisplay(lineWidth: num, w: num, rows: num, p15: num) {
     lastEntity.setDisplayBillboard(type="Fixed");
-    lastEntity.setDisplayScale(0.25, 0.25, 0.25);
+    if (p15 == 1) {
+        lastEntity.setDisplayScale(1.25, 0.25, 0.25);
+    } else {
+        lastEntity.setDisplayScale(0.25, 0.25, 0.25);
+    }
     lastEntity.setTextDisplayLineWidth(lineWidth);
     lastEntity.setTextDisplayTextAlignment(align="Left");
     lastEntity.setTextDisplayBackground("#000000", 0);
@@ -222,7 +240,7 @@ function wmPlace(c: num, id: num) {
         select reset;
     }
     select entitiesByUUID(st["deco"] as str);
-    selectedEntity.teleport(wmWallLoc(wx + (st["decoCols"] as num) * 2, wy, lift));
+    selectedEntity.teleport(wmWallLoc(wx + (st["w"] as num) / 2, wy, lift));
     select reset;
 }
 
@@ -287,24 +305,26 @@ function wmUnmap(c: num, id: num) {
 function wmDrawDeco(c: num, id: num) {
     line st: dict = global "s.o %var(c) %var(id)";
     line fd: num = st["decoFd"] as num;
-    line cols: num = st["decoCols"] as num;
+    line w: num = st["w"] as num;
     line key: str = "%var(c):%var(id)";
-    // rgb332: blue (0, 2, 3) when focused, grey (2, 2, 1) when not.
-    line bg: num = 73;
+    line bg: str = p15Color(0x606070);
     if (global "s.focus" == key) {
-        bg = 11;
+        bg = p15Color(0x2050C0);
     }
-    line fill: num = bg * 16843009;
-    memFill(fd, cols, 0, 0, cols, wmDecoH(), fill);
+    line white: str = p15Color(0xFFFFFF);
+    p15Fill(fd, 0, 0, w, wmDecoH(), bg);
     line title: str = st["title"] as str;
     if (title == "") {
         title = "window";
     }
-    line maxChars: num = num.floor((cols * 4 - 16) / 8);
-    fontText(fd, cols, 4, 1, title.trim(1, num.max(1, maxChars)), fontNibbles(255, bg));
-    // Close box: a white x on red (7, 1, 0), 8 pixels, at the right end.
-    memFill(fd, cols, cols - 3, 0, 2, wmDecoH(), 228 * 16843009);
-    fontChar(fd, cols, (cols - 3) * 4, 1, "x", fontNibbles(255, 228));
+    line maxChars: num = num.floor((w - 16) / 8);
+    if (maxChars >= 1) {
+        p15Text(fd, 2, 1, title.trim(1, maxChars), white, bg);
+    }
+    // Close box: a white x on red, 10 x 10 at the right end.
+    line red: str = p15Color(0xE03020);
+    p15Fill(fd, w - 10, 0, 10, wmDecoH(), red);
+    p15Text(fd, w - 9, 1, "x", white, red);
     wlsPut(c, id, "decoDirty", 1);
 }
 
@@ -407,12 +427,12 @@ function wmHit(x: num, y: num): list {
         line st: dict = global "s.o %var(hc) %var(hid)" as dict;
         line wx: num = st["wx"] as num;
         line wy: num = st["wy"] as num;
-        line decoW: num = (st["decoCols"] as num) * 4;
+        line decoW: num = st["w"] as num;
         if (x >= wx && x < wx + (st["w"] as num) && y >= wy && y < wy + (st["h"] as num)) {
             return [key, "body", x - wx, y - wy];
         }
         if (x >= wx && x < wx + decoW && y >= wy - wmDecoH() && y < wy) {
-            if (x >= wx + decoW - 12) {
+            if (x >= wx + decoW - 10) {
                 return [key, "close", 0, 0];
             }
             return [key, "title", x - wx, y - wy];

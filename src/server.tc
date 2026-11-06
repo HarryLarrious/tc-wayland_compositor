@@ -25,9 +25,9 @@ function wlsGlobals(): list {
     return [[1, "wl_compositor", 4], [2, "wl_shm", 1], [3, "wl_seat", 1], [4, "wl_output", 1], [5, "xdg_wm_base", 1]];
 }
 
-/** wl_shm formats offered: argb8888, xrgb8888 and rgb332 ("RGB8"). */
+/** wl_shm formats offered: argb8888, xrgb8888, rgb332 ("RGB8") and p15 glyph rows ("DF15", font.tc). */
 function wlsFormats(): list[num] {
-    return [0, 1, 943867730];
+    return [0, 1, 943867730, p15Format()];
 }
 
 /** The next event serial. */
