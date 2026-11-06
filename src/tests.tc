@@ -2,7 +2,8 @@
 // tools/read_test.sh collects from the client log.
 //   @wl test: the kernel and wire codec checks.
 //   On join (players with developer or owner access): the codec checks, then
-//   an end-to-end run of the compositor and its apps, and the canvas card.
+//   an end-to-end run of the desktop and its apps (the mouse checks turn the
+//   player to aim the cursor, as looking around does), and the canvas card.
 //   Deploying switches to play mode, which counts as joining, so every deploy
 //   runs them.
 
@@ -71,10 +72,10 @@ function wlCheckTrue(name: str, ok: num) {
     wlCheck(name, ok, 1);
 }
 
-/** Starts the join tests for this player: the compositor's wall goes in front of them. */
+/** Starts the join tests for this player: they are seated at the desktop. */
 function wlAutoStart {
-    wmStart();
     global "test.eye" = default.eyeLocation;
+    wmStart();
     global "test.player" = default.uuid;
     start wlAutoTest;
 }
@@ -121,15 +122,22 @@ function wtFd(key: str): num {
     return wlsGet(c, buf, "fd") as num;
 }
 
-/** 1 if window key's p15 buffer shows text (padded to 16) on one of its 8-pixel text rows, in the terminal's colors. */
+/** 1 if window key's p15 buffer shows text on one of its 8-pixel text rows, as the terminal draws it at the window's size. */
 function wtTermShows(key: str, text: str): num {
     line fd: num = wtFd(key);
-    line padded: str = text + "                ";
-    line want: list[str] = p15TextRows(padded.trim(1, 16), p15Patterns(p15Color(0xD0D0C0), p15Color(0x101018)));
-    repeat (line r to 12) {
+    line w: num = wtGet(key, "w");
+    line cols: num = num.floor(w / 8);
+    line bg: str = p15Color(0x101018);
+    line padded: str = text + " ".repeat(cols);
+    line want: list[str] = p15TextRows(padded.trim(1, cols), p15Patterns(p15Color(0xD0D0C0), bg));
+    line rest: str = "";
+    if (w > cols * 8) {
+        rest = bg.repeat(w - cols * 8);
+    }
+    repeat (line r to num.floor(wtGet(key, "h") / 8)) {
         line same: num = 1;
         repeat (line i to 8) {
-            if (global "k.mem %var(fd)"[(r - 1) * 8 + i] as str != want[i] as str) {
+            if (global "k.mem %var(fd)"[(r - 1) * 8 + i] as str != (want[i] as str) + rest) {
                 same = 0;
             }
         }
@@ -138,6 +146,35 @@ function wtTermShows(key: str, text: str): num {
         }
     }
     return 0;
+}
+
+/** A number from window key's state (w, h, wx, wy, ...). */
+function wtGet(key: str, field: str): num {
+    line p: list = key.split(":");
+    return wlsGet(num.parse(p[1] as str), num.parse(p[2] as str), field) as num;
+}
+
+/** Points the test player's cursor at canvas (x, y), as looking there does (4 pixels per degree), and lets wmInput see it. */
+function wtAim(x: num, y: num) {
+    select playersByName(global "test.player");
+    selected.setRotation(y / 4, x / 4);
+    select reset;
+    wait(3);
+}
+
+/** A left click where the cursor is, then a few ticks for the compositor to act on it. */
+function wtClick {
+    global "s.clicks".append(272);
+    wait(3);
+}
+
+/** Waits up to `ticks` ticks for window key to have width w. */
+function wtWaitWidth(key: str, w: num, ticks: num) {
+    line waited: num = 0;
+    while (wtGet(key, "w") != w && waited < ticks) {
+        wait;
+        waited += 1;
+    }
 }
 
 /** Waits up to `ticks` ticks for wtWindows() to reach n. */
@@ -153,6 +190,20 @@ function wtWaitWindows(n: num, ticks: num) {
 process wlAutoTest {
     allPlayers.sendMessage("WLTEST BEGIN");
     wlCodecChecks();
+
+    // The desktop: the player is seated and the cursor is up.
+    select playersByName(global "test.player");
+    line seated: num = 0;
+    if (selected.isRidingEntity()) {
+        seated = 1;
+    }
+    select reset;
+    wlCheckTrue("desk player seated", seated);
+    line hasCursor: num = 0;
+    if (global "s.desk"["cursor"] as str != "") {
+        hasCursor = 1;
+    }
+    wlCheckTrue("desk cursor", hasCursor);
 
     // A bare client sees the five globals and the p15 format.
     line c: num = wlcConnect("e2e");
@@ -218,6 +269,57 @@ process wlAutoTest {
             red = 1;
         }
         wlCheckTrue("e2e paint dot", red);
+
+        // Hit tests: the parts of the window under the pointer (raised, so the terminal doesn't cover it).
+        wmFocus(paint);
+        line wx: num = wtGet(paint, "wx");
+        line wy: num = wtGet(paint, "wy");
+        line w: num = wtGet(paint, "w");
+        line h: num = wtGet(paint, "h");
+        wlCheck("hit body", wmHit(wx + 20, wy + 20)[2], "body");
+        wlCheck("hit grip", wmHit(wx + w - 2, wy + h - 2)[2], "grip");
+        wlCheck("hit title", wmHit(wx + 20, wy - 5)[2], "title");
+        wlCheck("hit close", wmHit(wx + w - 4, wy - 5)[2], "close");
+
+        // Mouse: aim at the title bar, click, aim 40 right and 20 down, click: the window moves.
+        wtAim(wx + 20, wy - 5);
+        wlCheck("cursor follows look", global "s.ptr"["x"], wx + 20);
+        wtClick();
+        wtAim(wx + 60, wy + 15);
+        wtClick();
+        wlCheck("drag moves x", wtGet(paint, "wx"), wx + 40);
+        wlCheck("drag moves y", wtGet(paint, "wy"), wy + 20);
+        wx = wtGet(paint, "wx");
+        wy = wtGet(paint, "wy");
+
+        // Resize: click the grip, aim 20 right and 10 down, click: the client takes the new size.
+        wtAim(wx + w - 3, wy + h - 3);
+        wtClick();
+        wlCheck("resize mode", global "s.ptr"["resize"], paint);
+        wtAim(wx + w + 17, wy + h + 7);
+        // Holds the outline on screen for 3 seconds, long enough to see it.
+        allPlayers.sendMessage("WLTEST NOTE resize outline up");
+        wait(60);
+        wtClick();
+        wtWaitWidth(paint, w + 18, 100);
+        wlCheck("resize width", wtGet(paint, "w"), w + 18);
+        wlCheck("resize height", wtGet(paint, "h"), h + 8);
+        pfd = wtFd(paint);
+        prow = (global "k.mem %var(pfd)" as list)[21] as str;
+        line kept: num = 0;
+        if (prow.trim(11, 11) == p15Color(0xE02020) && prow.len() == w + 18) {
+            kept = 1;
+        }
+        wlCheckTrue("resize keeps the picture", kept);
+    }
+
+    // The terminal reflows to a new size and still shows its text.
+    if (term != "") {
+        wmResizeTo(term, 160, 104);
+        wtWaitWidth(term, 160, 100);
+        wlCheck("terminal resized", wtGet(term, "w"), 160);
+        wait(10);
+        wlCheck("terminal redraws after resize", wtTermShows(term, "hi"), 1);
     }
 
     // simple redraws on every frame callback, so its rows change.

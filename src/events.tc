@@ -20,3 +20,10 @@ playerevent chat {
         kbQueueLine(event.message);
     }
 }
+
+playerevent dismount {
+    // The desktop keeps its player seated: the seat holds the canvas still (@wl stop lets them off).
+    if (wmActive() == 1 && default.uuid == global "s.player") {
+        event.cancel();
+    }
+}

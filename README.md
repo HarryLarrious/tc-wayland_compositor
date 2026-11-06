@@ -14,15 +14,15 @@ build time.
 
 | Command | Does |
 | --- | --- |
-| `@wl start` | Starts the compositor. The wall goes 7 blocks in front of you, facing you. |
+| `@wl start` | Starts the desktop: you sit on an invisible seat, every window is locked to your screen, and where you look is the mouse. |
 | `@wl info` | Runs **wayland-info**: prints the globals, shm formats, seat and output in chat. |
 | `@wl simple` | Runs **simple**: a window with a bouncing square (like weston-simple-shm). |
 | `@wl paint` | Runs **paint**: a canvas. Click to paint. Type `1`–`8` for a color, `p` to toggle the pen (paint as you look), `c` to clear. |
 | `@wl terminal` | Runs **terminal**: a terminal with a small shell (`help`, `echo`, `ps`, `uptime`, `run <app>`, `clear`, `exit`). |
-| `@wl stop` | Stops the compositor and every app. |
+| `@wl stop` | Stops the desktop and every app, and lets you off the seat. |
 | `@wl stats` | Prints plot CPU, windows and connections. |
 | `@key <name>` | Types a special key: `enter`, `back`, `tab`, `esc`, `up`, `down`, `left`, `right`. |
-| `@wl look <x> <y>` | Turns you to look at wall pixel (x, y). This is for testing the pointer. |
+| `@wl look <x> <y>` | Points the cursor at canvas pixel (x, y), counted from the screen centre (it turns you). For testing. |
 | `@wl test` | Runs the kernel and wire self-test (prints `WLTEST` lines). |
 | `@scr <width> <height> [bandRows] [anim]` | Shows a screen-locked test canvas over your whole view (width a multiple of 32; `anim` 1 bounces a square). `@scr stop` removes it. |
 
@@ -31,18 +31,36 @@ Any app command starts the compositor if it isn't running.
 **Tests on join:** when a player with developer or owner access joins, or
 switches to play mode (which every deploy does), `tests.tc` runs:
 - the codec checks;
-- an end-to-end run of the compositor and its apps: globals and the p15
-  format, three windows mapped and presented, a typed line echoed by the
-  terminal, a click painting a dot, simple animating, and the close box;
+- an end-to-end run of the desktop and its apps:
+  - the seat and the cursor;
+  - globals and the p15 format;
+  - three windows mapped and presented;
+  - a typed line echoed by the terminal;
+  - a click painting a dot;
+  - hit tests for body, grip, title and close;
+  - the cursor following the player's look;
+  - a window dragged by its title bar;
+  - a window resized with its grip (paint keeps its picture, and the
+    terminal reflows);
+  - simple animating, and the close box;
 - the canvas card, then the card on screen for 5 seconds.
 
-It prints `WLTEST` lines to chat. After a deploy, `tools/read_test.sh 90`
-prints the run from the client log, so no keyboard or mouse input is
-needed.
+The mouse checks turn the player to aim the cursor, the way looking around
+does, and hold the resize outline up for 3 seconds. The run prints
+`WLTEST` lines to chat. After a deploy, `tools/read_test.sh 150` prints it
+from the client log, so no keyboard or mouse input is needed.
+
+**The desktop:** windows, title bars and the cursor are locked to your
+screen. They stay put wherever you look and draw over the world, on a
+canvas 360 pixels tall that fits the window's height. You sit on an
+invisible seat facing yaw 0; dismounting is cancelled while the desktop
+runs.
 
 **Input:**
-- **Pointer:** your crosshair. Each tick the compositor casts your look ray
-  onto the wall, which gives `wl_pointer` enter, leave and motion.
+- **Mouse:** where you look. The cursor moves 4 canvas pixels per degree of
+  yaw and pitch from straight ahead. The shader draws the cursor arrow from
+  the camera every frame, and the server uses the same mapping for
+  `wl_pointer` enter, leave and motion.
 - **Clicks:** left and right click send button 272 and 273 (a press and a
   release, since DF only reports clicks).
 - **Keyboard:** chat lines go to the focused window as `wl_keyboard` key
@@ -52,6 +70,11 @@ needed.
 - Click a window to focus and raise it. The focused window's title bar is
   blue.
 - Click a title bar to pick the window up, then click again to drop it.
+- Click the grip in a window's bottom-right corner, move, and click again
+  to resize it. A yellow outline shows the new size. The client gets
+  `xdg_toplevel.configure` with that size and redraws: simple rebuilds its
+  background, paint keeps its picture, and the terminal reflows. Windows
+  are 48×32 to 600×330 pixels, with even widths.
 - The red box closes the window (`xdg_toplevel.close`).
 
 ## How it works
@@ -59,8 +82,8 @@ needed.
 ```
  app process (apps.tc)            compositor process (server.tc)
  wlc.tc client library            dispatch -> objects, surfaces, xdg-shell
-        |    wire.tc words              |   wm.tc: wall, focus, pointer, keys
-        v                               v   render.tc: bands -> text displays
+        |    wire.tc words              |   wm.tc: desktop, seat, cursor, focus, move, resize
+        v                               v   render.tc: bands -> canvas text displays
  kernel.tc: k.q <c> c2s / s2c word queues, k.fdq fd queues, k.mem <fd> memfds
 ```
 
@@ -80,33 +103,39 @@ needed.
   handshake. The keymap is format 0 (no_keymap): both ends use the US evdev
   table in `keymap.tc`.
 - **Rendering** (`render.tc`, the pack). A window is a stack of text displays
-  ("bands"), one text line per pixel row. The core text shader decodes the
-  pixels:
+  ("bands"), one text line per pixel row.
+  - **p15 buffers** (fourcc `DF15`, 892421700; all the apps) are pools of
+    row strings, one `wl:p15` glyph (an rgb555 pixel) per pixel. A buffer's
+    `offset` is its first row in the pool, and `stride` counts glyphs.
+    Clients draw by splicing row strings (`font.tc`: `p15Fill`, `p15Text`,
+    `p15Splice`), so the compositor never converts pixels: a band is just
+    the canvas mark and its rows joined, about 0.05 µs of DF time per glyph.
+  - **Tagged formats** (`argb8888`, `xrgb8888`, `rgb332`) are still offered,
+    but they carry pixel data in the text color, which the canvas mark needs,
+    so their windows show grey on the desktop. (The `@px` spike still draws
+    them in the world.)
 
-  | Format | fourcc | How the data travels | Pixels per glyph | DF µs/glyph |
-  | --- | --- | --- | --- | --- |
-  | **p15** (all the apps) | `DF15` (892421700) | the buffer already holds glyph rows; a band is its rows joined, inside `<font:wl:p15>` | 1 (rgb555) | ~0.05 |
-  | `argb8888` | 0 | each word becomes a `wl:px` glyph (top byte) with a text color (low 24 bits) | 1 (alpha below 128 is cut out) | ~7 |
-  | `xrgb8888` | 1 | as argb8888 | 1 | ~7 |
-  | `rgb332` | `RGB8` | as argb8888 | 4, the leftmost in the low byte | ~7 |
-
-  A p15 buffer is a pool of row strings, one `wl:p15` glyph per pixel. The
-  buffer's `offset` is its first row in the pool, and `stride` counts glyphs.
-  Clients draw by splicing row strings (`font.tc`: `p15Fill`, `p15Text`,
-  `p15Splice`), so the compositor never converts pixels. p15 bands hold
-  about 1,024 glyphs, and the others about 512.
-
-  A commit's damage marks bands. Each tick the compositor redraws marked
-  bands within a budget of 1,500 units. A tagged glyph costs 1 unit and a p15
-  glyph costs 1/5, because the client re-processes every glyph sent, so the
-  budget is about 7,500 p15 glyphs a tick. A frame is presented when no
-  marked bands are left: the buffer is released and the frame callbacks run,
-  which paces the clients. Each glyph's last texel column is transparent, so
-  the bitmap font's advance equals the glyph width and pixels tile with no
-  gaps.
-- **Decorations** (`wm.tc`). Title bars are small p15 images that the
-  compositor draws itself with the 8×8 font (`font.tc`, from Lat15-VGA8), and
-  renders like any window.
+  Bands hold about 1,024 glyphs. A commit's damage marks bands, and each tick
+  the compositor redraws marked bands within a budget of about 7,500 glyphs,
+  because the client re-processes every glyph sent. A frame is presented
+  when no marked bands are left: the buffer is released and the frame
+  callbacks run, which paces the clients. Each glyph's last texel column is
+  transparent, so the bitmap font's advance equals the glyph width and
+  pixels tile with no gaps.
+- **Desktop** (`wm.tc`, `text.vsh`). Every band, title bar, grip, the resize
+  outline and the cursor is a text display at the seated player's eye. Its
+  translation puts it on a 360-pixel-tall canvas (40 canvas pixels per
+  block, from the screen centre), and its z stacks windows. The text color
+  marks canvas glyphs: `#FAB4A5` for windows, `A6` for sprites (pure black
+  is clear) and `A7` for the cursor, which the shader places at the camera's
+  look point every frame. Title bars are small p15 images the compositor
+  draws with the 8×8 font (`font.tc`, from Lat15-VGA8).
+- **Resize** (`wm.tc`, `wlc.tc`). The grip click starts an outline (four
+  sprite displays) that follows the cursor; the next click sends
+  `xdg_toplevel.configure` and `xdg_surface.configure`. `wlcConfigure` acks
+  it and reports the new size, and `wlcResize` swaps in a new buffer and
+  pool. The client's next commit at that size makes the compositor rebuild
+  the window's displays.
 
 ## Measurements
 
@@ -307,4 +336,9 @@ game, the last code and pack sent win.
   re-processes about 100–150k changed glyphs a second.
 - No key repeat and no held mouse buttons: DF reports clicks and chat lines,
   not presses and releases.
-- One player drives the input: whoever ran `@wl start`.
+- One player drives the input: whoever ran `@wl start`. The desktop's
+  displays aren't hidden from other players, so others nearby would see
+  them in the world.
+- The server assumes a 16:9 window when it clamps the cursor and places
+  windows. On wider windows the shader shows more canvas at the sides, so
+  the cursor can't reach the outer edges.

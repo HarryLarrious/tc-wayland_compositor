@@ -296,9 +296,9 @@ function wlsBind(c: num, name: num, iface: str, version: num, id: num) {
         // pointer | keyboard
         wlsSend(c, id, "wl_seat", "capabilities", [3]);
     } else if (iface == "wl_output") {
-        wlsSend(c, id, "wl_output", "geometry", [0, 0, 400, 250, 0, "DiamondFire", "plot wall", 0]);
+        wlsSend(c, id, "wl_output", "geometry", [0, 0, 400, 225, 0, "DiamondFire", "screen canvas", 0]);
         // current | preferred, 20 Hz (one frame per tick)
-        wlsSend(c, id, "wl_output", "mode", [3, wmWallWidth(), wmWallHeight(), 20000]);
+        wlsSend(c, id, "wl_output", "mode", [3, wmCanvasW(), wmCanvasH(), 20000]);
     }
 }
 

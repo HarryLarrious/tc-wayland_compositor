@@ -15,6 +15,8 @@ declare global "cl.next %var(c)": num;
 declare global "cl.globals %var(c)": list;
 declare global "cl.backlog %var(c)": list;
 declare global "cl.reg %var(c)": num;
+/** The size the connection's last xdg_toplevel.configure asked for: [w, h] (0 lets the client choose). */
+declare global "cl.size %var(c)": list[num];
 /** The frame callback of the connection's last wlcPresent. */
 declare global "cl.frame %var(c)": num;
 /** App name of each open connection, by connection number (as text); @wl ps and the terminal's ps read it. */
@@ -47,7 +49,7 @@ function wlcClose(c: num) {
     if (var.exists(global "k.names")) {
         global "k.names".remove("%var(c)");
     }
-    var.purgeMatching("cl.objs %var(c)", "cl.next %var(c)", "cl.globals %var(c)", "cl.backlog %var(c)", "cl.reg %var(c)", "cl.frame %var(c)", matchRequirement="Entire name");
+    var.purgeMatching("cl.objs %var(c)", "cl.next %var(c)", "cl.globals %var(c)", "cl.backlog %var(c)", "cl.reg %var(c)", "cl.frame %var(c)", "cl.size %var(c)", matchRequirement="Entire name");
 }
 
 /** Allocates an id for a new object of interface iface. */
@@ -150,8 +152,9 @@ function wlcBind(c: num, iface: str, version: num): num {
 /**
  * Opens a toplevel window of w x h pixels in wl_shm format `format` and
  * waits for its first configure. Returns its objects and buffer:
- * {surface, xdg, top, buf, fd, stride (words per row; glyphs for p15),
- * pointer, keyboard}. Draw p15 windows with font.tc's p15 functions.
+ * {surface, xdg, top, shm, format, w, h, pointer, keyboard} and wlcBuffer's
+ * {fd, pool, buf, stride}. Draw p15 windows with font.tc's p15 functions;
+ * pass configure events to wlcConfigure to follow resizes.
  */
 function wlcWindow(c: num, title: str, w: num, h: num, format: num): dict {
     wlcRoundtrip(c);
@@ -168,24 +171,7 @@ function wlcWindow(c: num, title: str, w: num, h: num, format: num): dict {
     wlcReq(c, top, "set_title", [title]);
     wlcReq(c, top, "set_app_id", [title]);
     wlcReq(c, surf, "commit", list.create());
-    // Shared memory: rgb332 rows are padded to whole words. A p15 pool holds
-    // one glyph string per row (black to start); stride and size count glyphs.
-    line stride: num = w * 4;
-    if (format == 943867730) {
-        stride = num.round(w / 4, mode="Ceiling") * 4;
-    }
-    line fd: num = 0;
-    if (format == p15Format()) {
-        fontInit();
-        stride = w;
-        fd = p15Create(w, h, p15Color(0));
-    } else {
-        fd = kMemCreate(stride * h);
-    }
-    line pool: num = wlcNew(c, "wl_shm_pool");
-    wlcReqFd(c, shm, "create_pool", [pool, fd, stride * h], [fd]);
-    line buf: num = wlcNew(c, "wl_buffer");
-    wlcReq(c, pool, "create_buffer", [buf, 0, w, h, stride, format]);
+    line mem: dict = wlcBuffer(c, shm, w, h, format);
     line ptr: num = wlcNew(c, "wl_pointer");
     wlcReq(c, seat, "get_pointer", [ptr]);
     line kb: num = wlcNew(c, "wl_keyboard");
@@ -210,10 +196,74 @@ function wlcWindow(c: num, title: str, w: num, h: num, format: num): dict {
         }
     }
     global "cl.backlog %var(c)" = keep;
+    line win: dict = {surface: surf, xdg: xs, top: top, shm: shm, format: format, w: w, h: h, pointer: ptr, keyboard: kb};
+    win.append(mem);
+    return win;
+}
+
+/**
+ * A new buffer of w x h pixels in its own pool: {fd, pool, buf, stride}
+ * (stride in words per row; glyphs for p15). rgb332 rows are padded to whole
+ * words; a p15 pool holds one glyph string per row, black to start.
+ */
+function wlcBuffer(c: num, shm: num, w: num, h: num, format: num): dict {
+    line stride: num = w * 4;
+    if (format == 943867730) {
+        stride = num.round(w / 4, mode="Ceiling") * 4;
+    }
+    line fd: num = 0;
+    if (format == p15Format()) {
+        fontInit();
+        stride = w;
+        fd = p15Create(w, h, p15Color(0));
+    } else {
+        fd = kMemCreate(stride * h);
+    }
+    line pool: num = wlcNew(c, "wl_shm_pool");
+    wlcReqFd(c, shm, "create_pool", [pool, fd, stride * h], [fd]);
+    line buf: num = wlcNew(c, "wl_buffer");
+    wlcReq(c, pool, "create_buffer", [buf, 0, w, h, stride, format]);
     if (format != p15Format()) {
         stride = stride / 4;
     }
-    return {surface: surf, xdg: xs, top: top, buf: buf, fd: fd, stride: stride, w: w, h: h, pointer: ptr, keyboard: kb};
+    return {fd: fd, pool: pool, buf: buf, stride: stride};
+}
+
+/**
+ * Handles configure events for window win. It remembers the size an
+ * xdg_toplevel.configure asks for and acks each xdg_surface.configure.
+ * Returns that size as [w, h] when it differs from the window's (a resize
+ * to do now, with wlcResize), else [].
+ */
+function wlcConfigure(c: num, win: dict, e: list): list[num] {
+    line a: list = e[4] as list;
+    if (e[1] as num == win["top"] as num && e[3] as str == "configure") {
+        global "cl.size %var(c)" = [a[1] as num, a[2] as num];
+    } else if (e[1] as num == win["xdg"] as num && e[3] as str == "configure") {
+        wlcReq(c, win["xdg"] as num, "ack_configure", [a[1]]);
+        if (var.exists(global "cl.size %var(c)")) {
+            line size: list[num] = global "cl.size %var(c)";
+            if (size[1] as num > 0 && size[2] as num > 0 && (size[1] as num != win["w"] as num || size[2] as num != win["h"] as num)) {
+                return size;
+            }
+        }
+    }
+    return list.create() as list[num];
+}
+
+/**
+ * Gives window win a new w x h buffer (the old buffer and pool are
+ * destroyed). Returns win updated; its oldFd is the old memory, for the app
+ * to copy from and then free with kMemFree.
+ */
+function wlcResize(c: num, win: dict, w: num, h: num): dict {
+    wlcReq(c, win["buf"] as num, "destroy", list.create());
+    wlcReq(c, win["pool"] as num, "destroy", list.create());
+    win["oldFd"] = win["fd"];
+    win.append(wlcBuffer(c, win["shm"] as num, w, h, win["format"] as num));
+    win["w"] = w;
+    win["h"] = h;
+    return win;
 }
 
 /** Attaches the window's buffer with damage [x, y, w, h, ...], asks for a frame callback (cl.frame) and commits. */

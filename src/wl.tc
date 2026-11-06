@@ -1,9 +1,9 @@
 // wl.tc: the @wl and @key commands.
 
 /**
- * @wl start | stop: the compositor (the wall is placed in front of you)
+ * @wl start | stop: the compositor: a screen-locked desktop (you sit; your look is the mouse)
  * @wl info | simple | paint | terminal: starts an app (and the compositor if needed)
- * @wl look <x> <y>: turns you to look at wall pixel (x, y) (for testing the pointer)
+ * @wl look <x> <y>: points the cursor at canvas pixel (x, y), from the centre (turns you)
  * @wl stats: plot CPU, windows and connections
  * @wl test: runs the self-test
  */
@@ -16,12 +16,10 @@ function wlCommand(parts: list) {
         wlSelfTest();
     } else if (sub == "start") {
         wmStart();
-        default.sendMessage(s"<gray>Compositor started. Look at a window to point; click to click; chat types into the focused window.");
+        default.sendMessage(s"<gray>Desktop started. Look around to move the mouse; click to click; chat types into the focused window.");
     } else if (sub == "look" && parts.len() >= 4 && wmActive() == 1) {
-        line target: loc = wmWallLoc(num.parse(parts[3] as str), num.parse(parts[4] as str), 0);
-        line eye: loc = default.eyeLocation;
-        line dir: vec = vec(target.x - eye.x, target.y - eye.y, target.z - eye.z);
-        default.teleport(default.location.setDirection(dir));
+        // The cursor is 4 canvas pixels per degree (wmCursor).
+        default.setRotation(num.parse(parts[4] as str) / 4, num.parse(parts[3] as str) / 4);
     } else if (sub == "stats") {
         line cpu: num = game.cpuUsage;
         line windows: num = 0;
@@ -40,10 +38,10 @@ function wlCommand(parts: list) {
         }
         appLaunch(sub);
     } else {
-        default.sendMessage(s"<yellow>@wl start</yellow><gray>, </gray><yellow>@wl stop</yellow> <gray>the compositor; the wall goes in front of you");
+        default.sendMessage(s"<yellow>@wl start</yellow><gray>, </gray><yellow>@wl stop</yellow> <gray>the desktop: you sit, and where you look is the mouse");
         default.sendMessage(s"<yellow>@wl info|simple|paint|terminal</yellow> <gray>starts an app");
         default.sendMessage(s"<yellow>@key enter|back|tab|esc|up|down|left|right</yellow> <gray>types a special key");
-        default.sendMessage(s"<gray>Chat goes to the focused window. Click a title bar to drag it, the x to close it.");
+        default.sendMessage(s"<gray>Chat goes to the focused window. Click a title bar to move it, the x to close it, the corner grip to resize it.");
     }
 }
 

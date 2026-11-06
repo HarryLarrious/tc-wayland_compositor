@@ -85,15 +85,8 @@ function simpleBg(x: num, y: num): num {
     return (r << 16) + (g << 8) + b;
 }
 
-/** weston-simple-shm style: a gradient window with a bouncing square, redrawn on every frame callback. */
-process appSimple {
-    line run: num = global "wl.alive";
-    line c: num = wlcConnect("simple");
-    line w: num = 64;
-    line h: num = 48;
-    line win: dict = wlcWindow(c, "simple", w, h, p15Format());
-    line fd: num = win["fd"] as num;
-    // The background rows, kept to restore what the square covered.
+/** appSimple's background rows for a w x h window. */
+function simpleBgRows(w: num, h: num): list[str] {
     line bg: list[str] = list.create() as list[str];
     repeat (line y to h) {
         line row: list[str] = list.create() as list[str];
@@ -103,6 +96,19 @@ process appSimple {
         bg.append(row.join(""));
         cpuYield(30);
     }
+    return bg;
+}
+
+/** weston-simple-shm style: a gradient window with a bouncing square, redrawn on every frame callback. Resizable. */
+process appSimple {
+    line run: num = global "wl.alive";
+    line c: num = wlcConnect("simple");
+    line w: num = 64;
+    line h: num = 48;
+    line win: dict = wlcWindow(c, "simple", w, h, p15Format());
+    line fd: num = win["fd"] as num;
+    // The background rows, kept to restore what the square covered.
+    line bg: list[str] = simpleBgRows(w, h);
     global "k.mem %var(fd)" = bg;
     line size: num = 8;
     line square: str = p15Color(0xFFFFFF).repeat(size);
@@ -116,7 +122,20 @@ process appSimple {
     while (quit == 0 && wlcAlive(c, run) == 1) {
         for (line ev of wlcPoll(c)) {
             line e: list = ev as list;
-            if (e[3] as str == "done" && e[1] as num == global "cl.frame %var(c)") {
+            line resize: list[num] = wlcConfigure(c, win, e);
+            if (resize.len() == 2) {
+                // A new size: a new buffer and background, and the square kept inside.
+                win = wlcResize(c, win, resize[1] as num, resize[2] as num);
+                kMemFree(win["oldFd"] as num);
+                w = win["w"] as num;
+                h = win["h"] as num;
+                fd = win["fd"] as num;
+                bg = simpleBgRows(w, h);
+                global "k.mem %var(fd)" = bg;
+                sx = num.min(sx, w - size);
+                sy = num.min(sy, h - size);
+                wlcPresent(c, win, [0, 0, w, h]);
+            } else if (e[3] as str == "done" && e[1] as num == global "cl.frame %var(c)") {
                 ready = 1;
             } else if (e[3] as str == "close" && e[2] as str == "xdg_toplevel") {
                 quit = 1;
@@ -124,7 +143,6 @@ process appSimple {
         }
         if (ready == 1 && quit == 0) {
             ready = 0;
-            line ox: num = sx;
             line oy: num = sy;
             sx += vx;
             sy += vy;
@@ -152,7 +170,7 @@ process appSimple {
     wlcClose(c);
 }
 
-/** Paint: left click paints a dot; keys 1-8 pick a color, p toggles the pen (paint as you look), c clears. */
+/** Paint: left click paints a dot; keys 1-8 pick a color, p toggles the pen (paint as you look), c clears. Resizing keeps the picture. */
 process appPaint {
     line run: num = global "wl.alive";
     line c: num = wlcConnect("paint");
@@ -177,7 +195,33 @@ process appPaint {
             line a: list = e[4] as list;
             line what: str = (e[2] as str) + "." + (e[3] as str);
             line dot: num = 0;
-            if (what == "wl_pointer.enter") {
+            line resize: list[num] = wlcConfigure(c, win, e);
+            if (resize.len() == 2) {
+                // Keep the picture: rows are cut or padded with white to the new size.
+                line oldW: num = w;
+                line oldH: num = h;
+                win = wlcResize(c, win, resize[1] as num, resize[2] as num);
+                w = win["w"] as num;
+                h = win["h"] as num;
+                line oldFd: num = win["oldFd"] as num;
+                line rows: list[str] = list.create() as list[str];
+                repeat (line y to h) {
+                    if (y <= oldH) {
+                        line old: str = (global "k.mem %var(oldFd)" as list)[y] as str;
+                        if (w <= oldW) {
+                            rows.append(old.trim(1, w));
+                        } else {
+                            rows.append(old + white.repeat(w - oldW));
+                        }
+                    } else {
+                        rows.append(white.repeat(w));
+                    }
+                }
+                kMemFree(oldFd);
+                fd = win["fd"] as num;
+                global "k.mem %var(fd)" = rows;
+                damage = [0, 0, w, h];
+            } else if (what == "wl_pointer.enter") {
                 mx = num.floor(a[3] as num);
                 my = num.floor(a[4] as num);
             } else if (what == "wl_pointer.motion") {
@@ -225,16 +269,20 @@ process appPaint {
     wlcClose(c);
 }
 
-/** Draws terminal row r (0-based) of text (padded to 16 characters): 8 full pixel rows. */
-function termRow(fd: num, r: num, text: str, pat: list[str]) {
-    line padded: str = text + "                ";
-    line rows: list[str] = p15TextRows(padded.trim(1, 16), pat);
+/** Draws terminal row r (0-based) of text, padded to `cols` characters and then to w pixels with bg: 8 full pixel rows. */
+function termRow(fd: num, r: num, text: str, pat: list[str], cols: num, w: num, bg: str) {
+    line padded: str = text + " ".repeat(cols);
+    line rows: list[str] = p15TextRows(padded.trim(1, cols), pat);
+    line rest: str = "";
+    if (w > cols * 8) {
+        rest = bg.repeat(w - cols * 8);
+    }
     repeat (line i to 8) {
-        global "k.mem %var(fd)"[r * 8 + i] = rows[i];
+        global "k.mem %var(fd)"[r * 8 + i] = (rows[i] as str) + rest;
     }
 }
 
-/** A 16 x 12 character terminal with a tiny shell. */
+/** A terminal with a tiny shell: 8 x 8 characters, as many as its size holds (16 x 12 to start). Resizing reflows it. */
 process appTerm {
     line run: num = global "wl.alive";
     fontInit();
@@ -244,7 +292,11 @@ process appTerm {
     line win: dict = wlcWindow(c, "terminal", w, h, p15Format());
     line fd: num = win["fd"] as num;
     // Light grey on near-black.
-    line pat: list[str] = p15Patterns(p15Color(0xD0D0C0), p15Color(0x101018));
+    line bg: str = p15Color(0x101018);
+    line pat: list[str] = p15Patterns(p15Color(0xD0D0C0), bg);
+    line cols: num = num.floor(w / 8);
+    line lines: num = num.floor(h / 8);
+    p15Fill(fd, 0, 0, w, h, bg);
     line rows: list[str] = ["wayland term", "type help", ""];
     line input: str = "";
     line shift: num = 0;
@@ -256,7 +308,18 @@ process appTerm {
             line e: list = ev as list;
             line a: list = e[4] as list;
             line what: str = (e[2] as str) + "." + (e[3] as str);
-            if (what == "wl_keyboard.modifiers") {
+            line resize: list[num] = wlcConfigure(c, win, e);
+            if (resize.len() == 2) {
+                win = wlcResize(c, win, resize[1] as num, resize[2] as num);
+                kMemFree(win["oldFd"] as num);
+                w = win["w"] as num;
+                h = win["h"] as num;
+                fd = win["fd"] as num;
+                cols = num.max(1, num.floor(w / 8));
+                lines = num.max(2, num.floor(h / 8));
+                p15Fill(fd, 0, 0, w, h, bg);
+                redraw = 1;
+            } else if (what == "wl_keyboard.modifiers") {
                 shift = (a[2] as num) & 1;
             } else if (what == "wl_keyboard.key" && a[4] as num == 1) {
                 line code: num = a[3] as num;
@@ -289,36 +352,36 @@ process appTerm {
             }
         }
         if (redraw == 1 || typed == 1) {
-            // Wrap the prompt line at 16 characters and keep the last 12 rows on screen.
+            // Wrap the prompt line at the width and keep the last screenful of rows.
             line screen: list[str] = rows;
             line prompt: str = "$ %var(input)_";
-            while (prompt.len() > 16) {
-                screen.append(prompt.trim(1, 16));
-                prompt = prompt.trim(17, prompt.len());
+            while (prompt.len() > cols) {
+                screen.append(prompt.trim(1, cols));
+                prompt = prompt.trim(cols + 1, prompt.len());
             }
             screen.append(prompt);
-            while (screen.len() > 12) {
+            while (screen.len() > lines) {
                 screen.remove(1);
             }
-            while (rows.len() > 11) {
+            while (rows.len() > 40) {
                 rows.remove(1);
             }
             if (redraw == 1) {
-                repeat (line r to 12) {
+                repeat (line r to lines) {
                     line text: str = "";
                     if (r <= screen.len()) {
                         text = screen[r] as str;
                     }
-                    termRow(fd, r - 1, text, pat);
+                    termRow(fd, r - 1, text, pat, cols, w, bg);
                     cpuYield(30);
                 }
                 wlcPresent(c, win, [0, 0, w, h]);
             } else {
                 // Only the prompt rows changed.
                 line n: num = screen.len();
-                termRow(fd, n - 1, screen[n] as str, pat);
+                termRow(fd, n - 1, screen[n] as str, pat, cols, w, bg);
                 if (n >= 2) {
-                    termRow(fd, n - 2, screen[n - 1] as str, pat);
+                    termRow(fd, n - 2, screen[n - 1] as str, pat, cols, w, bg);
                 }
                 wlcPresent(c, win, [0, (num.max(1, n - 1) - 1) * 8, w, 16]);
             }

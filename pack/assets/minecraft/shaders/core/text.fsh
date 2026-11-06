@@ -23,6 +23,7 @@ layout(location = 1) in float cylindricalVertexDistance;
 layout(location = 2) in vec4 vertexColor;
 layout(location = 3) in vec2 texCoord0;
 layout(location = 4) in vec4 rawColor;
+layout(location = 5) in float spriteKey;
 
 #ifndef OIT_ALPHA_ONLY
 layout(location = 0) out vec4 fragColor;
@@ -62,6 +63,10 @@ void main() {
     #else
     vec4 texColor = texture(Sampler0, texCoord0);
     vec4 decoded = wl_px_decode(texColor, rawColor, pixel);
+    // Sprites and the cursor (text.vsh) are clear where they are pure black.
+    if (pixel && spriteKey > 0.5 && decoded.rgb == vec3(0.0)) {
+        discard;
+    }
     color = pixel ? decoded : texColor * vertexColor * ColorModulator;
     #endif
 
