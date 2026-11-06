@@ -35,6 +35,7 @@ function wmRender(budget: num) {
     line windows: list[str] = global "s.windows";
     windows.appendList(global "s.panels");
     for (line key of windows) {
+        cpuGuard();
         line p: list = (key as str).split(":");
         line c: num = num.parse(p[1] as str);
         line id: num = num.parse(p[2] as str);
@@ -79,6 +80,7 @@ function wmRenderBands(c: num, id: num, dirty: list[num], budget: num): list[num
     line uuids: list[str] = st["displays"] as list[str];
     line left: num = budget;
     while (dirty.len() > 0 && left > 0) {
+        cpuGuard();
         line band: num = dirty[1] as num;
         dirty.remove(1);
         line y0: num = (band - 1) * bandRows;

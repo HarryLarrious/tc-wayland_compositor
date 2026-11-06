@@ -3,6 +3,7 @@
 /**
  * @wl start | stop: the compositor: a screen-locked desktop (you sit; your look is the mouse)
  * @wl info | simple | paint | terminal: starts an app (and the compositor if needed)
+ * @wl run <program>: runs a C program from rv/ on the RISC-V runner (hello, bench, isa, window)
  * @wl bg <rrggbb>: the desktop color (black to start)
  * @wl look <x> <y>: points the cursor at canvas pixel (x, y), from the centre (turns you)
  * @wl stats: plot CPU, windows and connections
@@ -18,6 +19,15 @@ function wlCommand(parts: list) {
     } else if (sub == "start") {
         wmStart();
         default.sendMessage(s"<gray>Desktop started. Look around to move the mouse; click to click; chat types into the focused window.");
+    } else if (sub == "run" && parts.len() >= 3) {
+        line prog: str = parts[3] as str;
+        if (prog == "window" && wmActive() == 0) {
+            wmStart();
+        }
+        if (rvLaunch(prog) == 0) {
+            line known: str = rvPrograms().join(", ");
+            default.sendMessage(s"<red>no program %var(prog)</red><gray>; there are %var(known)");
+        }
     } else if (sub == "bg" && parts.len() >= 3) {
         line color: num = wlHex(parts[3] as str);
         if (color < 0) {
@@ -49,6 +59,7 @@ function wlCommand(parts: list) {
         default.sendMessage(s"<yellow>@wl start</yellow><gray>, </gray><yellow>@wl stop</yellow> <gray>the desktop: you sit, and where you look is the mouse");
         default.sendMessage(s"<yellow>@wl info|simple|paint|terminal</yellow> <gray>starts an app (or use the home button on the taskbar)");
         default.sendMessage(s"<yellow>@wl bg rrggbb</yellow> <gray>sets the desktop color");
+        default.sendMessage(s"<yellow>@wl run hello|bench|isa|window</yellow> <gray>runs a C program on the RISC-V runner");
         default.sendMessage(s"<yellow>@key enter|back|tab|esc|up|down|left|right</yellow> <gray>types a special key");
         default.sendMessage(s"<gray>Chat goes to the focused window. Click a title bar to move it, the x to close it, the corner grip to resize it.");
     }

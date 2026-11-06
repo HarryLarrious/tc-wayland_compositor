@@ -175,6 +175,7 @@ function wlsDispatch(c: num) {
         return;
     }
     for (line fr of wlFrames(words)) {
+        cpuGuard();
         line m: list = fr as list;
         line obj: num = m[1] as num;
         line iface: str = wlsIface(c, obj);

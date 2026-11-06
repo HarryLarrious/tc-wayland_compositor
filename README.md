@@ -19,6 +19,7 @@ build time.
 | `@wl simple` | Runs **simple**: a window with a bouncing square (like weston-simple-shm). |
 | `@wl paint` | Runs **paint**: a canvas. Click to paint. Type `1`–`8` for a color, `p` to toggle the pen (paint as you look), `c` to clear. |
 | `@wl terminal` | Runs **terminal**: a terminal with a small shell (`help`, `echo`, `ps`, `uptime`, `run <app>`, `clear`, `exit`). |
+| `@wl run <program>` | Runs a C program on the RISC-V machine: `hello`, `bench`, `isa` or `window` (a Wayland window written in C). The terminal's `run` and the start menu (`window`) start them too. |
 | `@wl bg <rrggbb>` | Sets the desktop color (black to start), like the start menu's swatches. |
 | `@wl stop` | Stops the desktop and every app, and lets you off the seat. |
 | `@wl stats` | Prints plot CPU, windows and connections. |
@@ -49,6 +50,10 @@ switches to play mode (which every deploy does), `tests.tc` runs:
   - taskbar buttons focusing, minimizing and restoring a window;
   - simple animating, and the menu closing it;
   - a swatch setting the desktop color, and a desktop click closing the menu;
+- the RISC-V machine: `hello`, `isa` and `bench` print exactly what the
+  reference emulator prints (every RV32IM instruction group checked), and
+  the C `window` program maps its window, paints on a click and exits from
+  its close box;
 - the canvas card, then the card on screen for 5 seconds.
 
 The mouse checks turn the player to aim the cursor, the way looking around
@@ -98,6 +103,14 @@ runs.
   background, paint keeps its picture, and the terminal reflows. Windows
   are 48×32 to 600×330 pixels, with even widths.
 - The red box closes the window (`xdg_toplevel.close`).
+
+**RISC-V** (`rv.tc`, `rv/`). The plot is also a computer: a RISC-V machine
+(RV32IM) written in Terracotta runs real compiled C. Write a program in
+`rv/`, build it with `tools/rv2tc.py`, and run it with `@wl run <name>`. It
+prints to chat, and it can open windows: `rv/window.c` is a Wayland client
+in plain C that builds its own wire messages, binds the globals, makes an
+`xdg_toplevel`, shares a p15 buffer and handles pointer clicks and
+`close`, all through the same compositor as the Terracotta apps.
 
 ## How it works
 
@@ -173,6 +186,41 @@ runs.
   camera (the first-person hand and held item), and `position_tex_color.vsh`
   drops textured GUI vertices in the bottom-centre HUD area and at the
   crosshair. Text keeps drawing, so the chat box still works.
+- **RISC-V machine** (`rv.tc`, `rv/`, `tools/rv2tc.py`).
+  - **Build.** `rv2tc.py` compiles each `rv/<name>.c` with clang for
+    RV32IM (`-march=rv32im -mabi=ilp32`), freestanding, linked by lld
+    (`rv/link.ld`) into one flat image from address 0. `rv/crt0.S` calls
+    `main` and then `exit`; `rv/rv.c` has `memset`, `memcpy`, `strlen` and
+    number printing. The image goes into `src/rvbin.tc` as text, three
+    characters of a 4,096-character alphabet per word, in 1,000-word
+    chunks so no template nears DF's size limit.
+  - **Machine.** Each program is its own process with 40,000 bytes of RAM
+    (one 10,000-word list), 32 registers and a pc. At load, every image
+    word is decoded once into five lists (op, rd, rs1, rs2, imm, with
+    branch targets and `lui`/`auipc` values worked out). Running an
+    instruction is then a few list reads and one branch of a dispatch
+    tree: the 21 common ops are in `rvSlice`, the rest in `rvExec`.
+  - **Arithmetic.** Registers hold signed 32-bit values. DF's bitwise
+    operators are 64-bit (see DiamondFire findings), so left shifts mask
+    and then wrap, logical right shifts shift the unsigned value, and sub-word
+    stores work in unsigned and convert back. `mul` and the `mulh` family
+    use 16-bit halves; division uses exact `%` on the magnitudes.
+  - **System calls** (`ecall`, `rv/rv.h`). Linux's `write` (to chat),
+    `exit` and `sched_yield`, then the machine's own: a socket to the
+    compositor (`wl_connect`, `wl_send`, `wl_recv`, carrying real Wayland
+    words and fds through `kernel.tc`, whole messages only), a p15 memfd
+    (`p15_create`) and `p15_blit`, which turns rgb555 pixels in RAM into
+    glyph rows, standing in for shared memory.
+  - **Checking.** `tools/rvemu.py` is a plain RV32IM emulator, the
+    reference: `rv2tc.py` stores each console program's output from it as
+    the join tests' expected output. `tools/rvdf.py` models `rv.tc` under
+    DF's number rules, so changes to the interpreter can be checked in
+    seconds before deploying.
+- **CPU limits** (`cpu.tc`). LagSlayer stops any codeline that runs too
+  long. Every loop that can run long calls `cpuGuard()`: a thread gets 2 ms
+  a tick, and while the whole plot is above 50% CPU each guarded loop
+  waits a tick per pass. The RISC-V machine runs 2 ms a tick and skips its
+  turn while the plot is that busy.
 - **Resize** (`wm.tc`, `wlc.tc`). The grip click starts an outline (four
   sprite displays) that follows the cursor; the next click sends
   `xdg_toplevel.configure` and `xdg_surface.configure`. `wlcConfigure` acks
@@ -303,11 +351,20 @@ decoded by `px.glsl`).
 
 ## DiamondFire findings
 
-- **Bitwise:** DF's bitwise actions work on 32-bit signed ints, and the
-  64-bit option (`^>>`, `^<<` and the rest) gives wrong results. For example,
-  `0xFFFF0000 ^>>> 24` comes back unchanged. Words reach 2^32, so the code
-  splits off the top byte with `%` and exact division and keeps shifts below
-  2^31.
+- **Bitwise:** the default bitwise operators work on 64-bit integers, not
+  32-bit ones (measured 2026-11-05): `1 << 31` is 2147483648, `255 << 24`
+  is 4278190080, and `2147483648 | 0` stays 2147483648. `&`, `|`, `^`, `~`
+  and `>>` are right on signed 32-bit values. `>>>` is wrong for negative
+  numbers (`-1 >>> 1` gives -1). The explicit 64-bit option (`^>>`, `^<<`
+  and the rest) also gives wrong results: `0xFFFF0000 ^>>> 24` comes back
+  unchanged. Words reach 2^32, so the wire code splits off the top byte with
+  `%` and exact division.
+- **Modulo:** `%` rounds toward zero: `-7 % 3` is -1.
+- **List limit:** a list holds at most 10,000 entries, and appending past
+  that does nothing, silently. A loop that grows a list until it reaches a
+  size over 8,192 by doubling never ends, and LagSlayer stops it.
+- **LagSlayer:** "A codeline surpassed its CPU limit" stops the thread. About
+  24 ms of code in one tick reads as 100% in `game.cpuUsage`.
 - **Function arguments:** `f(argNum(...), argNum(...))` once gave a wrong
   argument (height 0). Putting each call's result in its own variable first
   fixed it.
@@ -332,6 +389,9 @@ decoded by `px.glsl`).
 | `src/render.tc` | Band rendering and presentation |
 | `src/wlc.tc` | Client library |
 | `src/apps.tc` | wayland-info, simple, paint, terminal |
+| `src/rv.tc` | The RISC-V machine: loader, decoder, interpreter, system calls |
+| `src/rvbin.tc` | Generated program images and expected outputs (`tools/rv2tc.py`) |
+| `rv/` | C programs for the machine (`hello`, `bench`, `isa`, `window`), its runtime (`crt0.S`, `rv.c`, `rv.h`) and linker script |
 | `src/font.tc`, `src/font8.tc` | p15 drawing: glyph lookup, fills, splices and 8×8 text; font rows generated by `tools/font2tc.py` |
 | `src/p15.tc` | Generated `wl:p15` glyph table (`pack/src/px_assets.py`) |
 | `src/bench.tc` | Data path benchmarks (`@bench`) |
@@ -343,11 +403,14 @@ decoded by `px.glsl`).
 | `src/spike.tc` | The original render spike (`@px`) |
 | `src/glyphs.tc` | Generated pixel-glyph and hex tables (`pack/src/px_assets.py`) |
 | `src/pack.tc` | Sends the pack on join |
-| `src/cpu.tc` | `cpuYield`, from tc-neural_network |
+| `src/cpu.tc` | `cpuGuard`, the CPU limiter for loops, and `cpuYield` (from tc-neural_network) for the benchmarks |
 | `pack/` | Resource pack source (`pack/src/` holds generators and is not shipped) |
 | `tools/build_pack.py` | Validates, builds and publishes the pack |
 | `tools/deploy.sh` | Compiles, places the code and switches to play mode |
 | `tools/read_test.sh` | Prints the last `WLTEST` run from the client log (after a deploy: `tools/read_test.sh 90`) |
+| `tools/rv2tc.py` | Builds `rv/*.c` and writes `src/rvbin.tc` |
+| `tools/rvemu.py` | Reference RV32IM emulator |
+| `tools/rvdf.py` | Model of `rv.tc` under DF's number rules (checks the interpreter without deploying) |
 | `tools/netrate.sh` | Prints the client's receive rate from the server, once a second |
 
 ## Build
@@ -355,6 +418,8 @@ decoded by `px.glsl`).
 ```sh
 python3 tools/protocol2tc.py                     # regenerate src/protocol.tc
 python3 tools/font2tc.py                         # regenerate src/font8.tc
+python3 tools/rv2tc.py                           # build rv/*.c into src/rvbin.tc (needs clang and lld with RISC-V)
+python3 tools/rvdf.py                            # check the interpreter model against the reference emulator
 python3 pack/src/px_assets.py                    # regenerate the pixel fonts, src/glyphs.tc and src/p15.tc
 python3 tools/build_pack.py --check              # validate the pack
 python3 tools/build_pack.py --publish --push     # build, commit to pack-dist, push
@@ -390,6 +455,11 @@ game, the last code and pack sent win.
   windows. On wider windows the shader shows more canvas at the sides, so
   the cursor can't reach the outer edges. The taskbar's buttons stay in the
   16:9 area, and its color runs out to the sides.
+- The RISC-V machine runs about 5,000 to 7,500 instructions a second (2 ms
+  of plot CPU a tick), like a very early home computer: fine for text,
+  small tools and windows that redraw on input, too slow for animation. A
+  program has 40,000 bytes of RAM, no files and no floating point (RV32IM
+  only), and the compressed (C) extension isn't supported.
 - The taskbar shows 7 window buttons and the start menu lists 5 windows.
 - The hand hiding drops every entity and item vertex within 2 blocks of the
   camera while you sit at the desktop, so a mob or item that close

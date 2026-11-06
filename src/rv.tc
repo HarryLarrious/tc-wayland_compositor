@@ -1,0 +1,763 @@
+// rv.tc: a RISC-V (RV32IM) computer that runs compiled C programs (rv/,
+// packed into rvbin.tc by tools/rv2tc.py). Each program runs in its own
+// process, a little machine:
+//   RAM      rvRamWords() 32-bit words (40,000 bytes), from address 0; the
+//            program image is loaded at 0 and sp starts at the top
+//   registers x0-x31 in a list (x0 at 1; writes to x0 go to entry 33)
+//   pc       a word index into RAM (byte address / 4 + 1)
+// Every image word is decoded once at load into five lists (op, rd, rs1,
+// rs2, imm), so running an instruction is a few list reads and one branch
+// of a dispatch tree, with the common ones in rvSlice and the rest in
+// rvExec. Registers hold signed 32-bit values. DF's bitwise operators work
+// on 64-bit integers: & | ^ ~ and >> are right on signed 32-bit values, but
+// << doesn't wrap at 32 bits and >>> is wrong for negative numbers. So left
+// shifts mask first and wrap after, logical right shifts make the value
+// unsigned first, and sums are wrapped back into range. Multiplies are done
+// in 16-bit halves and divisions with exact %, since DF numbers are 64-bit
+// fixed point with 3 decimals (% rounds toward zero).
+//
+// Programs talk to the world through ecall (rv/rv.h): write to chat,
+// exit, yield the tick, and a socket to the compositor that carries the
+// real Wayland wire protocol, plus p15 memfds they can blit pixels into.
+// A machine runs for rvBudget() microseconds a tick.
+
+/** Programs waiting for a runner process (one is taken per start). */
+declare global "rv.queue": list[str];
+/** The last run of each program: its output so far, and {exit, instructions, ms} once it ends. */
+declare global "rv.out %var(name)": str;
+declare global "rv.stats %var(name)": dict;
+
+/** The machine of the running process. */
+declare local "rv.name": str;
+declare local "rv.x": list[num];
+declare local "rv.m": list[num];
+declare local "rv.op": list[num];
+declare local "rv.rd": list[num];
+declare local "rv.ra": list[num];
+declare local "rv.rb": list[num];
+declare local "rv.im": list[num];
+declare local "rv.pc": num;
+/** Why the last slice stopped: 0 budget used, 1 yield, 2 exit, 3 fault. */
+declare local "rv.stop": num;
+declare local "rv.exit": num;
+declare local "rv.instret": num;
+/** stdout's unfinished line; the program's compositor sockets; received words not yet read. */
+declare local "rv.line": str;
+declare local "rv.socks": list[num];
+declare local "rv.rx": list[num];
+
+/** RAM size in words: 40,000 bytes, under DF's 10,000-entry list limit. */
+function rvRamWords(): num {
+    return 10000;
+}
+
+/** CPU time a machine gets each tick, in microseconds. */
+function rvBudget(): num {
+    return cpuSlice();
+}
+
+/** Starts program `name` in a new machine; 0 if there is no such program. */
+function rvLaunch(name: str): num {
+    if (rvImage(name).len() == 0) {
+        return 0;
+    }
+    if (!var.exists(global "rv.queue")) {
+        global "rv.queue" = list.create() as list[str];
+    }
+    global "rv.queue".append(name);
+    start rvProc;
+    return 1;
+}
+
+/** v wrapped into the signed 32-bit range. */
+function rvWrap(v: num): num {
+    line r: num = v % 4294967296;
+    if (r < 0) {
+        r += 4294967296;
+    }
+    if (r >= 2147483648) {
+        r -= 4294967296;
+    }
+    return r;
+}
+
+/** v as unsigned (0 to 2^32 - 1). */
+function rvU(v: num): num {
+    if (v < 0) {
+        return v + 4294967296;
+    }
+    return v;
+}
+
+/** A list of n zeros (n at most 10,000, DF's list limit). It doubles, but never past n: a list over the limit stops growing. */
+function rvZeros(n: num): list[num] {
+    if (n <= 0) {
+        return list.create() as list[num];
+    }
+    line z: list[num] = [0];
+    while (z.len() < n) {
+        z.appendList(z.trim(1, num.min(z.len(), n - z.len())));
+        cpuGuard();
+    }
+    return z;
+}
+
+/** Loads program `name` into this process's machine; returns its image size in words (0 if none). */
+function rvLoad(name: str): num {
+    line chunks: list[str] = rvImage(name);
+    line alpha: str = rvAlpha();
+    line words: list[num] = list.create() as list[num];
+    for (line ch of chunks) {
+        line s: str = ch as str;
+        repeat (line i to s.len() / 3) {
+            line b: num = i * 3;
+            line v: num = alpha.find(s.trim(b - 2, b - 2)) - 1 + (alpha.find(s.trim(b - 1, b - 1)) - 1) * 4096 + (alpha.find(s.trim(b, b)) - 1) * 16777216;
+            if (v >= 2147483648) {
+                v -= 4294967296;
+            }
+            words.append(v);
+            cpuGuard();
+        }
+    }
+    line n: num = words.len();
+    words.appendList(rvZeros(rvRamWords() - n));
+    local "rv.name" = name;
+    local "rv.m" = words;
+    local "rv.x" = rvZeros(33);
+    // sp (x2) at the top of RAM.
+    local "rv.x"[3] = rvRamWords() * 4;
+    local "rv.op" = rvZeros(n);
+    local "rv.rd" = rvZeros(n);
+    local "rv.ra" = rvZeros(n);
+    local "rv.rb" = rvZeros(n);
+    local "rv.im" = rvZeros(n);
+    repeat (line i to n) {
+        rvDecode(i);
+        cpuGuard();
+    }
+    local "rv.pc" = 1;
+    local "rv.stop" = 0;
+    local "rv.exit" = 0;
+    local "rv.instret" = 0;
+    local "rv.line" = "";
+    local "rv.socks" = list.create() as list[num];
+    local "rv.rx" = list.create() as list[num];
+    return n;
+}
+
+/**
+ * Decodes RAM word i into the op lists. Ops by number (the dispatch order):
+ *  1 addi  2 lw  3 sw  4 add  5 bne  6 beq  7 jal  8 lui  9 jalr
+ * 10 slli 11 srli 12 srai 13 andi 14 blt 15 bge 16 bltu 17 bgeu 18 lbu
+ * 19 sb 20 sub 21 auipc 22 or 23 and 24 xor 25 sll 26 srl 27 sra 28 slt
+ * 29 sltu 30 slti 31 sltiu 32 xori 33 ori 34 lb 35 lh 36 lhu 37 sh
+ * 38-45 mul mulh mulhsu mulhu div divu rem remu 46 ecall 47 fence
+ * 48 illegal. Branch and jal imm is the target word index; auipc and lui
+ * imm is the value to load.
+ */
+function rvDecode(i: num) {
+    line inst: num = local "rv.m"[i];
+    line opc: num = inst & 127;
+    line rd: num = (inst >> 7) & 31;
+    line f3: num = (inst >> 12) & 7;
+    line rs1: num = (inst >> 15) & 31;
+    line rs2: num = (inst >> 20) & 31;
+    line f7: num = (inst >> 25) & 127;
+    line imm: num = inst >> 20;
+    line op: num = 48;
+    if (opc == 0x13) {
+        op = [1, 10, 30, 31, 32, 11, 33, 13][f3 + 1] as num;
+        if (f3 == 1 || f3 == 5) {
+            imm = rs2;
+            if (f3 == 5 && f7 == 32) {
+                op = 12;
+            } else if (rs2 == 0) {
+                // A shift by 0 copies the register: addi 0.
+                op = 1;
+            } else if (f3 == 1) {
+                // slli: rb holds the mask of the bits that stay in 32 bits.
+                rs2 = (1 << (32 - imm)) - 2;
+            }
+        }
+    } else if (opc == 0x03) {
+        op = [34, 35, 2, 48, 18, 36, 48, 48][f3 + 1] as num;
+    } else if (opc == 0x23) {
+        op = [19, 37, 3, 48, 48, 48, 48, 48][f3 + 1] as num;
+        imm = ((inst >> 25) << 5) | rd;
+    } else if (opc == 0x33) {
+        if (f7 == 1) {
+            op = 38 + f3;
+        } else if (f7 == 0) {
+            op = [4, 25, 28, 29, 24, 26, 22, 23][f3 + 1] as num;
+        } else if (f7 == 32 && f3 == 0) {
+            op = 20;
+        } else if (f7 == 32 && f3 == 5) {
+            op = 27;
+        }
+    } else if (opc == 0x63) {
+        op = [6, 5, 48, 48, 14, 15, 16, 17][f3 + 1] as num;
+        line b: num = ((inst >> 31) << 12) | (((inst >> 7) & 1) << 11) | (((inst >> 25) & 63) << 5) | (((inst >> 8) & 15) << 1);
+        imm = i + b / 4;
+    } else if (opc == 0x6F) {
+        op = 7;
+        line j: num = ((inst >> 31) << 20) | (((inst >> 12) & 255) << 12) | (((inst >> 20) & 1) << 11) | (((inst >> 21) & 1023) << 1);
+        imm = i + j / 4;
+    } else if (opc == 0x37) {
+        op = 8;
+        imm = inst & -4096;
+    } else if (opc == 0x17) {
+        op = 21;
+        imm = rvWrap((i - 1) * 4 + (inst & -4096));
+    } else if (opc == 0x67) {
+        op = 9;
+    } else if (opc == 0x0F) {
+        op = 47;
+    } else if (opc == 0x73 && inst == 0x73) {
+        op = 46;
+    }
+    if (rd == 0) {
+        rd = 32;
+    }
+    local "rv.op"[i] = op;
+    local "rv.rd"[i] = rd + 1;
+    local "rv.ra"[i] = rs1 + 1;
+    local "rv.rb"[i] = rs2 + 1;
+    local "rv.im"[i] = imm;
+}
+
+/** Stops the machine with a fault message. */
+function rvFault(why: str) {
+    line pc: num = (local "rv.pc" - 1) * 4;
+    line name: str = local "rv.name";
+    allPlayers.sendMessage(s"<red>[%var(name)] fault at pc %var(pc): %var(why)");
+    local "rv.stop" = 3;
+}
+
+/**
+ * Runs the machine for about `budget` microseconds, or until it yields,
+ * exits or faults (rv.stop). The common instructions are here; the rest go
+ * to rvExec.
+ */
+function rvSlice(budget: num) {
+    line t0: num = game.microsecondsSinceStartup;
+    local "rv.stop" = 0;
+    line pc: num = local "rv.pc";
+    line k: num = 0;
+    while (local "rv.stop" == 0 && game.microsecondsSinceStartup - t0 < budget) {
+        // k counts the instructions run; only a break leaves the block early.
+        k = 64;
+        repeat (line step to 64) {
+            line op: num = local "rv.op"[pc];
+            if (op <= 9) {
+                if (op == 1) {
+                    line v: num = local "rv.x"[local "rv.ra"[pc]] + local "rv.im"[pc];
+                    if (v > 2147483647) {
+                        v -= 4294967296;
+                    } else if (v < -2147483648) {
+                        v += 4294967296;
+                    }
+                    local "rv.x"[local "rv.rd"[pc]] = v;
+                    pc += 1;
+                } else if (op == 2) {
+                    line ad: num = local "rv.x"[local "rv.ra"[pc]] + local "rv.im"[pc];
+                    if (ad < 0 || ad >= 40000) {
+                        local "rv.pc" = pc;
+                        rvFault("load from %var(ad)");
+                        k = step;
+                        break;
+                    }
+                    local "rv.x"[local "rv.rd"[pc]] = local "rv.m"[(ad >> 2) + 1];
+                    pc += 1;
+                } else if (op == 3) {
+                    line ad: num = local "rv.x"[local "rv.ra"[pc]] + local "rv.im"[pc];
+                    if (ad < 0 || ad >= 40000) {
+                        local "rv.pc" = pc;
+                        rvFault("store to %var(ad)");
+                        k = step;
+                        break;
+                    }
+                    local "rv.m"[(ad >> 2) + 1] = local "rv.x"[local "rv.rb"[pc]];
+                    pc += 1;
+                } else if (op == 4) {
+                    line v: num = local "rv.x"[local "rv.ra"[pc]] + local "rv.x"[local "rv.rb"[pc]];
+                    if (v > 2147483647) {
+                        v -= 4294967296;
+                    } else if (v < -2147483648) {
+                        v += 4294967296;
+                    }
+                    local "rv.x"[local "rv.rd"[pc]] = v;
+                    pc += 1;
+                } else if (op == 5) {
+                    if (local "rv.x"[local "rv.ra"[pc]] != local "rv.x"[local "rv.rb"[pc]]) {
+                        pc = local "rv.im"[pc];
+                    } else {
+                        pc += 1;
+                    }
+                } else if (op == 6) {
+                    if (local "rv.x"[local "rv.ra"[pc]] == local "rv.x"[local "rv.rb"[pc]]) {
+                        pc = local "rv.im"[pc];
+                    } else {
+                        pc += 1;
+                    }
+                } else if (op == 7) {
+                    line dest: num = local "rv.im"[pc];
+                    local "rv.x"[local "rv.rd"[pc]] = pc * 4;
+                    pc = dest;
+                } else if (op == 8) {
+                    local "rv.x"[local "rv.rd"[pc]] = local "rv.im"[pc];
+                    pc += 1;
+                } else {
+                    // jalr: the target before rd is written (rd may be rs1).
+                    line dest: num = ((local "rv.x"[local "rv.ra"[pc]] + local "rv.im"[pc]) >> 2) + 1;
+                    local "rv.x"[local "rv.rd"[pc]] = pc * 4;
+                    pc = dest;
+                }
+            } else if (op <= 21) {
+                if (op == 10) {
+                    // slli: keep the bits that stay in 32 bits (mask in rb), shift, wrap.
+                    line v: num = (local "rv.x"[local "rv.ra"[pc]] & local "rv.rb"[pc]) << local "rv.im"[pc];
+                    if (v > 2147483647) {
+                        v -= 4294967296;
+                    }
+                    local "rv.x"[local "rv.rd"[pc]] = v;
+                    pc += 1;
+                } else if (op == 11) {
+                    // srli (by 1 to 31): shift the unsigned value.
+                    line v: num = local "rv.x"[local "rv.ra"[pc]];
+                    if (v < 0) {
+                        v += 4294967296;
+                    }
+                    local "rv.x"[local "rv.rd"[pc]] = v >> local "rv.im"[pc];
+                    pc += 1;
+                } else if (op == 12) {
+                    local "rv.x"[local "rv.rd"[pc]] = local "rv.x"[local "rv.ra"[pc]] >> local "rv.im"[pc];
+                    pc += 1;
+                } else if (op == 13) {
+                    local "rv.x"[local "rv.rd"[pc]] = local "rv.x"[local "rv.ra"[pc]] & local "rv.im"[pc];
+                    pc += 1;
+                } else if (op == 14) {
+                    if (local "rv.x"[local "rv.ra"[pc]] < local "rv.x"[local "rv.rb"[pc]]) {
+                        pc = local "rv.im"[pc];
+                    } else {
+                        pc += 1;
+                    }
+                } else if (op == 15) {
+                    if (local "rv.x"[local "rv.ra"[pc]] >= local "rv.x"[local "rv.rb"[pc]]) {
+                        pc = local "rv.im"[pc];
+                    } else {
+                        pc += 1;
+                    }
+                } else if (op == 16) {
+                    // Unsigned: flipping the sign bit makes a signed compare unsigned.
+                    if ((local "rv.x"[local "rv.ra"[pc]] ^ -2147483648) < (local "rv.x"[local "rv.rb"[pc]] ^ -2147483648)) {
+                        pc = local "rv.im"[pc];
+                    } else {
+                        pc += 1;
+                    }
+                } else if (op == 17) {
+                    if ((local "rv.x"[local "rv.ra"[pc]] ^ -2147483648) >= (local "rv.x"[local "rv.rb"[pc]] ^ -2147483648)) {
+                        pc = local "rv.im"[pc];
+                    } else {
+                        pc += 1;
+                    }
+                } else if (op == 18) {
+                    line ad: num = local "rv.x"[local "rv.ra"[pc]] + local "rv.im"[pc];
+                    if (ad < 0 || ad >= 40000) {
+                        local "rv.pc" = pc;
+                        rvFault("load from %var(ad)");
+                        k = step;
+                        break;
+                    }
+                    local "rv.x"[local "rv.rd"[pc]] = (local "rv.m"[(ad >> 2) + 1] >> ((ad & 3) << 3)) & 255;
+                    pc += 1;
+                } else if (op == 19) {
+                    line ad: num = local "rv.x"[local "rv.ra"[pc]] + local "rv.im"[pc];
+                    if (ad < 0 || ad >= 40000) {
+                        local "rv.pc" = pc;
+                        rvFault("store to %var(ad)");
+                        k = step;
+                        break;
+                    }
+                    line wi: num = (ad >> 2) + 1;
+                    line sh: num = (ad & 3) << 3;
+                    // In unsigned 32-bit, then back to signed.
+                    line v: num = ((local "rv.m"[wi] & 4294967295) & ~(255 << sh)) | ((local "rv.x"[local "rv.rb"[pc]] & 255) << sh);
+                    if (v > 2147483647) {
+                        v -= 4294967296;
+                    }
+                    local "rv.m"[wi] = v;
+                    pc += 1;
+                } else if (op == 20) {
+                    line v: num = local "rv.x"[local "rv.ra"[pc]] - local "rv.x"[local "rv.rb"[pc]];
+                    if (v > 2147483647) {
+                        v -= 4294967296;
+                    } else if (v < -2147483648) {
+                        v += 4294967296;
+                    }
+                    local "rv.x"[local "rv.rd"[pc]] = v;
+                    pc += 1;
+                } else {
+                    local "rv.x"[local "rv.rd"[pc]] = local "rv.im"[pc];
+                    pc += 1;
+                }
+            } else {
+                local "rv.pc" = pc;
+                rvExec(op);
+                pc = local "rv.pc";
+                if (local "rv.stop" != 0) {
+                    k = step;
+                        break;
+                }
+            }
+        }
+        local "rv.instret" += k;
+    }
+    local "rv.pc" = pc;
+}
+
+/** Runs the less common instruction at rv.pc (ops 22 and up). */
+function rvExec(op: num) {
+    line pc: num = local "rv.pc";
+    line a: num = local "rv.x"[local "rv.ra"[pc]];
+    line b: num = local "rv.x"[local "rv.rb"[pc]];
+    line im: num = local "rv.im"[pc];
+    line rd: num = local "rv.rd"[pc];
+    if (op <= 33) {
+        line v: num = 0;
+        if (op == 22) {
+            v = a | b;
+        } else if (op == 23) {
+            v = a & b;
+        } else if (op == 24) {
+            v = a ^ b;
+        } else if (op == 25) {
+            line sh: num = b & 31;
+            v = (a & ((1 << (32 - sh)) - 1)) << sh;
+            if (v > 2147483647) {
+                v -= 4294967296;
+            }
+        } else if (op == 26) {
+            line sh: num = b & 31;
+            v = a;
+            if (sh > 0) {
+                if (v < 0) {
+                    v += 4294967296;
+                }
+                v = v >> sh;
+            }
+        } else if (op == 27) {
+            v = a >> (b & 31);
+        } else if (op == 28) {
+            if (a < b) {
+                v = 1;
+            }
+        } else if (op == 29) {
+            if ((a ^ -2147483648) < (b ^ -2147483648)) {
+                v = 1;
+            }
+        } else if (op == 30) {
+            if (a < im) {
+                v = 1;
+            }
+        } else if (op == 31) {
+            if ((a ^ -2147483648) < (im ^ -2147483648)) {
+                v = 1;
+            }
+        } else if (op == 32) {
+            v = a ^ im;
+        } else {
+            v = a | im;
+        }
+        local "rv.x"[rd] = v;
+        local "rv.pc" = pc + 1;
+    } else if (op <= 37) {
+        line ad: num = a + im;
+        if (ad < 0 || ad >= rvRamWords() * 4) {
+            rvFault("access at %var(ad)");
+            return;
+        }
+        line wi: num = (ad >> 2) + 1;
+        line w: num = local "rv.m"[wi];
+        line sh: num = (ad & 3) << 3;
+        if (op == 34) {
+            line v: num = (w >> sh) & 255;
+            if (v > 127) {
+                v -= 256;
+            }
+            local "rv.x"[rd] = v;
+        } else if (op == 35) {
+            line v: num = (w >> sh) & 65535;
+            if (v > 32767) {
+                v -= 65536;
+            }
+            local "rv.x"[rd] = v;
+        } else if (op == 36) {
+            local "rv.x"[rd] = (w >> sh) & 65535;
+        } else {
+            line v: num = ((w & 4294967295) & ~(65535 << sh)) | ((b & 65535) << sh);
+            if (v > 2147483647) {
+                v -= 4294967296;
+            }
+            local "rv.m"[wi] = v;
+        }
+        local "rv.pc" = pc + 1;
+    } else if (op <= 45) {
+        local "rv.x"[rd] = rvMulDiv(op, a, b);
+        local "rv.pc" = pc + 1;
+    } else if (op == 46) {
+        rvSyscall();
+    } else if (op == 47) {
+        local "rv.pc" = pc + 1;
+    } else {
+        line inst: num = rvU(local "rv.m"[pc]);
+        rvFault("illegal instruction %var(inst)");
+    }
+}
+
+/** The high word of unsigned ua * ub, both 0 to 2^32 - 1, in 16-bit halves so every step is exact. */
+function rvMulHiU(ua: num, ub: num): num {
+    line al: num = ua % 65536;
+    line ah: num = (ua - al) / 65536;
+    line bl: num = ub % 65536;
+    line bh: num = (ub - bl) / 65536;
+    line low: num = al * bl;
+    line mid: num = ah * bl + al * bh + (low - low % 65536) / 65536;
+    return ah * bh + (mid - mid % 65536) / 65536;
+}
+
+/** mul, mulh, mulhsu, mulhu, div, divu, rem and remu (ops 38-45) of signed words a and b. */
+function rvMulDiv(op: num, a: num, b: num): num {
+    line ua: num = rvU(a);
+    line ub: num = rvU(b);
+    if (op == 38) {
+        line al: num = ua % 65536;
+        line ah: num = (ua - al) / 65536;
+        line bl: num = ub % 65536;
+        line bh: num = (ub - bl) / 65536;
+        return rvWrap(al * bl + ((ah * bl + al * bh) % 65536) * 65536);
+    } else if (op <= 41) {
+        line hi: num = rvMulHiU(ua, ub);
+        // Signed operands: subtract the other operand once per negative one (mod 2^32).
+        if (op != 41 && a < 0) {
+            hi -= ub;
+        }
+        if (op == 39 && b < 0) {
+            hi -= ua;
+        }
+        return rvWrap(hi);
+    }
+    if (op == 43 || op == 45) {
+        if (ub == 0) {
+            if (op == 43) {
+                return -1;
+            }
+            return a;
+        }
+        line r: num = ua % ub;
+        if (op == 43) {
+            return rvWrap((ua - r) / ub);
+        }
+        return rvWrap(r);
+    }
+    if (b == 0) {
+        if (op == 42) {
+            return -1;
+        }
+        return a;
+    }
+    // Signed: divide magnitudes, then round toward zero with the signs.
+    line ma: num = num.abs(a);
+    line mb: num = num.abs(b);
+    line r: num = ma % mb;
+    line q: num = (ma - r) / mb;
+    if (op == 42) {
+        if ((a < 0) != (b < 0)) {
+            q = 0 - q;
+        }
+        return rvWrap(q);
+    }
+    if (a < 0) {
+        r = 0 - r;
+    }
+    return r;
+}
+
+/** The byte at address ad. */
+function rvByte(ad: num): num {
+    return (local "rv.m"[(ad >> 2) + 1] >> ((ad & 3) << 3)) & 255;
+}
+
+/** Sends a finished stdout line to chat. */
+function rvFlush {
+    line name: str = local "rv.name";
+    line text: str = local "rv.line";
+    allPlayers.sendMessage(s"<gray>[%var(name)]</gray> %var(text)");
+    local "rv.line" = "";
+}
+
+/** The ecall at rv.pc: a7 (x17) picks the call, a0-a4 (x10-x14) are its arguments, a0 its result. */
+function rvSyscall {
+    line n: num = local "rv.x"[18];
+    line a0: num = local "rv.x"[11];
+    line a1: num = local "rv.x"[12];
+    line a2: num = local "rv.x"[13];
+    line a3: num = local "rv.x"[14];
+    line a4: num = local "rv.x"[15];
+    line name: str = local "rv.name";
+    line ret: num = 0;
+    if (n == 64) {
+        // write(fd, buf, len): stdout and stderr go to chat a line at a time.
+        line out: str = "";
+        repeat (line i to a2) {
+            cpuGuard();
+            line c: num = rvByte(a1 + i - 1);
+            if (c == 10) {
+                local "rv.line" = local "rv.line" + out;
+                global "rv.out %var(name)" = global "rv.out %var(name)" + out + "\n";
+                out = "";
+                rvFlush();
+            } else if (c >= 32 && c <= 126) {
+                out = out + global "wl.ascii".trim(c - 31, c - 31);
+            } else {
+                out = out + "?";
+            }
+        }
+        local "rv.line" = local "rv.line" + out;
+        global "rv.out %var(name)" = global "rv.out %var(name)" + out;
+        ret = a2;
+    } else if (n == 93) {
+        local "rv.exit" = a0;
+        local "rv.stop" = 2;
+        return;
+    } else if (n == 124) {
+        local "rv.stop" = 1;
+    } else if (n == 4096) {
+        ret = rvWrap(wlsTime());
+    } else if (n == 4097) {
+        // wl_connect: a socket to the compositor, the same kind wlc.tc uses.
+        ret = kConnect();
+        if (!var.exists(global "k.names")) {
+            global "k.names" = {};
+        }
+        global "k.names"["%var(ret)"] = "rv:%var(name)";
+        local "rv.socks".append(ret);
+    } else if (n == 4098) {
+        // wl_send(sock, words, n, fd): one message, its words as the compositor reads them (unsigned).
+        if (local "rv.socks".find(a0) == 0 || a1 < 0 || a1 + a2 * 4 > rvRamWords() * 4) {
+            ret = -1;
+        } else {
+            line words: list[num] = local "rv.m".trim((a1 >> 2) + 1, (a1 >> 2) + a2);
+            line uw: list[num] = list.create() as list[num];
+            for (line w of words) {
+                uw.append(rvU(w as num));
+                cpuGuard();
+            }
+            line fds: list[num] = list.create() as list[num];
+            if (a3 >= 0) {
+                fds.append(a3);
+            }
+            kSend(a0, "c2s", uw, fds);
+        }
+    } else if (n == 4099) {
+        // wl_recv(sock, words, max): whole messages only, at most max words.
+        if (local "rv.socks".find(a0) == 0 || kOpen(a0) == 0) {
+            ret = -1;
+        } else {
+            line rx: list[num] = local "rv.rx";
+            rx.appendList(kTake(a0, "s2c"));
+            line take: num = 0;
+            while (take + 2 <= rx.len()) {
+                line h: num = rx[take + 2] as num;
+                line size: num = (h - h % 65536) / 65536 / 4;
+                if (size < 2 || take + size > a2) {
+                    break;
+                }
+                take += size;
+            }
+            repeat (line i to take) {
+                local "rv.m"[(a1 >> 2) + i] = rvWrap(rx[i] as num);
+                cpuGuard();
+            }
+            if (take > 0) {
+                if (take == rx.len()) {
+                    rx = list.create() as list[num];
+                } else {
+                    rx = rx.trim(take + 1, rx.len());
+                }
+            }
+            local "rv.rx" = rx;
+            ret = take;
+        }
+    } else if (n == 4100) {
+        // p15_create(w, h): a p15 image memfd, black.
+        fontInit();
+        ret = p15Create(a0, a1, p15Glyph(0));
+    } else if (n == 4101) {
+        // p15_blit(fd, src, w, y, rows): rows y to y + rows - 1 of a w-wide rgb555 image at src.
+        fontInit();
+        line img: list[str] = global "k.mem %var(a0)" as list[str];
+        repeat (line r to a4) {
+            line row: str = "";
+            line base: num = a1 + (a3 + r - 1) * a2 * 2;
+            repeat (line x to a2) {
+                cpuGuard();
+                line ad: num = base + (x - 1) * 2;
+                row = row + p15Glyph((local "rv.m"[(ad >> 2) + 1] >> ((ad & 2) << 3)) & 32767);
+            }
+            img[a3 + r] = row;
+            cpuGuard();
+        }
+        global "k.mem %var(a0)" = img;
+    } else if (n == 4102) {
+        ret = rvWrap(local "rv.instret");
+    } else {
+        rvFault("unknown system call %var(n)");
+        return;
+    }
+    local "rv.x"[11] = ret;
+    local "rv.pc" += 1;
+}
+
+/** A RISC-V machine running the next program in rv.queue until it exits or faults. */
+process rvProc {
+    if (!var.exists(global "rv.queue") || global "rv.queue".len() == 0) {
+        return;
+    }
+    line name: str = global "rv.queue"[1];
+    global "rv.queue".remove(1);
+    wlInit();
+    global "rv.out %var(name)" = "";
+    var.purgeMatching("rv.stats %var(name)", matchRequirement="Entire name");
+    line words: num = rvLoad(name);
+    line run: num = global "wl.alive";
+    line t0: num = game.microsecondsSinceStartup;
+    while (local "rv.stop" < 2) {
+        // The machine gets a turn only while the plot has CPU to spare.
+        if (game.cpuUsage <= cpuPlotMax()) {
+            rvSlice(rvBudget());
+        }
+        // A program with a window ends with the desktop.
+        if (local "rv.socks".len() > 0 && global "wl.alive" != run) {
+            local "rv.exit" = -1;
+            local "rv.stop" = 2;
+        }
+        if (local "rv.stop" < 2) {
+            wait;
+        }
+    }
+    if (local "rv.line" != "") {
+        rvFlush();
+    }
+    for (line s of local "rv.socks") {
+        kHangup(s as num);
+    }
+    line ms: num = num.round((game.microsecondsSinceStartup - t0) / 1000);
+    line instret: num = local "rv.instret";
+    line code: num = local "rv.exit";
+    if (local "rv.stop" == 3) {
+        code = -2;
+    }
+    global "rv.stats %var(name)" = {exit: code, instructions: instret, ms: ms, words: words};
+    line rate: num = num.round(instret * 1000 / num.max(ms, 1));
+    allPlayers.sendMessage(s"<gray>[%var(name)] exit %var(code): %var(instret) instructions in %var(ms) ms, %var(rate)/s");
+}

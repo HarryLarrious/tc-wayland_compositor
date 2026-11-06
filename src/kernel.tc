@@ -99,13 +99,16 @@ function kMemCreate(bytes: num): num {
     global "k.nextFd" += 1;
     line fd: num = global "k.nextFd";
     line words: num = num.max(1, num.round(bytes / 4, mode="Ceiling"));
-    // Doubling builds the zeros in a few list copies instead of one append per word.
+    // Doubling builds the zeros in a few list copies instead of one append
+    // per word. It never overshoots: a list past DF's 10,000-entry limit
+    // stops growing, which would loop forever.
+    words = num.min(words, 10000);
     line zeros: list[num] = [0];
     while (zeros.len() < words) {
-        line copy: list[num] = zeros;
-        zeros.appendList(copy);
+        zeros.appendList(zeros.trim(1, num.min(zeros.len(), words - zeros.len())));
+        cpuGuard();
     }
-    global "k.mem %var(fd)" = zeros.trim(1, words);
+    global "k.mem %var(fd)" = zeros;
     return fd;
 }
 

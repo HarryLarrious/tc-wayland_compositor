@@ -52,6 +52,7 @@ function p15Create(w: num, h: num, g: str): num {
     line rows: list[str] = list.create() as list[str];
     repeat (h) {
         rows.append(row);
+        cpuGuard();
     }
     global "k.mem %var(fd)" = rows;
     return fd;
@@ -81,6 +82,7 @@ function p15Fill(fd: num, x: num, y: num, w: num, h: num, g: str) {
     repeat (line r to h) {
         line idx: num = y + r;
         global "k.mem %var(fd)"[idx] = p15Splice(global "k.mem %var(fd)"[idx] as str, x, piece);
+        cpuGuard();
     }
 }
 
@@ -102,6 +104,7 @@ function p15Patterns(fg: str, bg: str): list[str] {
             }
         }
         out.append(s);
+        cpuGuard();
     }
     global "p15.pat"[key] = out;
     return out;
@@ -120,6 +123,7 @@ function p15TextRows(text: str, pat: list[str]): list[str] {
             parts.append(pat[(global "font.rows"[(code - 1) * 8 + r] as num) + 1] as str);
         }
         rows.append(parts.join(""));
+        cpuGuard();
     }
     return rows;
 }

@@ -135,6 +135,7 @@ function wtTermShows(key: str, text: str): num {
         rest = bg.repeat(w - cols * 8);
     }
     repeat (line r to num.floor(wtGet(key, "h") / 8)) {
+        cpuGuard();
         line same: num = 1;
         repeat (line i to 8) {
             if (global "k.mem %var(fd)"[(r - 1) * 8 + i] as str != (want[i] as str) + rest) {
@@ -224,6 +225,30 @@ function wtHome {
 function wtBgPixel(): str {
     line fd: num = wtFd(wmPanelKey(0));
     return (global "k.mem %var(fd)" as list)[1] as str;
+}
+
+/** Runs RISC-V program `name` and waits up to `ticks` ticks for it to end; 1 if it ended. */
+function wtRvRun(name: str, ticks: num): num {
+    rvLaunch(name);
+    line waited: num = 0;
+    while (!var.exists(global "rv.stats %var(name)") && waited < ticks) {
+        wait;
+        waited += 1;
+    }
+    if (var.exists(global "rv.stats %var(name)")) {
+        return 1;
+    }
+    return 0;
+}
+
+/** A RISC-V program's run: prints its speed as a NOTE and checks its exit code. */
+function wtRvStats(name: str) {
+    line st: dict = global "rv.stats %var(name)";
+    line n: num = st["instructions"] as num;
+    line ms: num = st["ms"] as num;
+    line rate: num = num.round(n * 1000 / num.max(ms, 1));
+    allPlayers.sendMessage("WLTEST NOTE rv %var(name): %var(n) instructions in %var(ms) ms (%var(rate)/s)");
+    wlCheck("rv %var(name) exits 0", st["exit"], 0);
 }
 
 /** The join tests: codec checks, the compositor and its apps end to end, and the canvas card. */
@@ -436,7 +461,7 @@ process wlAutoTest {
         }
         wtHome();
         wtWaitPanels(3, 60);
-        wtClickAt(wtMenuAt(shellMenuW() - 6, 5 + index));
+        wtClickAt(wtMenuAt(shellMenuW() - 6, shellWinRow() + index));
         wtWaitWindows(2, 100);
         wlCheck("menu closes simple", wtWindows(), 2);
         wlCheck("menu closes after closing a window", wmPanelKey(2), "");
@@ -445,7 +470,7 @@ process wlAutoTest {
     // The menu's swatches set the desktop color; the last is 3060a0.
     wtHome();
     wtWaitPanels(3, 60);
-    wtClickAt(wtMenuAt(7 * 14 + 7, 12));
+    wtClickAt(wtMenuAt(7 * 14 + 7, shellSwatchRow()));
     wait(3);
     wlCheck("swatch sets the desktop color", global "shell.bg", 0x3060A0);
     wait(5);
@@ -454,6 +479,86 @@ process wlAutoTest {
     wtClickAt([310, -170]);
     wtWaitPanels(2, 60);
     wlCheck("desktop click closes the menu", wmPanelKey(2), "");
+    // RISC-V: C programs compiled for RV32IM run on the in-DF machine (rv.tc).
+    // Their output must match the reference emulator's (tools/rvemu.py).
+    wlCheck("rv hello ran", wtRvRun("hello", 1200), 1);
+    if (var.exists(global "rv.stats hello")) {
+        wtRvStats("hello");
+        wlCheck("rv hello output", global "rv.out hello", rvExpect("hello"));
+    }
+    wlCheck("rv isa ran", wtRvRun("isa", 3000), 1);
+    if (var.exists(global "rv.stats isa")) {
+        wtRvStats("isa");
+        line got: list = (global "rv.out isa" as str).split("\n");
+        line want: list = rvExpect("isa").split("\n");
+        repeat (line i to want.len()) {
+            if ((want[i] as str) != "") {
+                line group: str = (want[i] as str).split(" ")[1] as str;
+                line gl: str = "";
+                if (i <= got.len()) {
+                    gl = got[i] as str;
+                }
+                wlCheck("rv isa %var(group)", gl, want[i]);
+            }
+        }
+    }
+    wlCheck("rv bench ran", wtRvRun("bench", 2400), 1);
+    if (var.exists(global "rv.stats bench")) {
+        wtRvStats("bench");
+        // The first line only: the second counts instructions, which the runner tallies per slice.
+        wlCheck("rv bench primes", (global "rv.out bench" as str).split("\n")[1], rvExpect("bench").split("\n")[1]);
+    }
+
+    // The C window: a Wayland client in C, speaking the wire protocol itself.
+    rvLaunch("window");
+    line cwin: str = "";
+    line waited2: num = 0;
+    while (cwin == "" && waited2 < 2400) {
+        wait;
+        waited2 += 1;
+        cwin = wtWindow("rv:window");
+    }
+    wlCheck("rv window mapped", wtDiffers(cwin, ""), 1);
+    if (cwin != "") {
+        waited2 = 0;
+        while (wtPending() > 0 && waited2 < 200) {
+            wait;
+            waited2 += 1;
+        }
+        line cfd: num = wtFd(cwin);
+        line first: str = ((global "k.mem %var(cfd)" as list)[1] as str).trim(1, 1);
+        wlCheck("rv window draws its gradient", first, p15Glyph(8));
+        // A click paints a red dot at the pointer (10, 10).
+        line cx: num = wtGet(cwin, "wx");
+        line cy: num = wtGet(cwin, "wy");
+        wtClickAt([cx + 10, cy + 10]);
+        waited2 = 0;
+        line dot: str = "";
+        while (dot != p15Glyph(0x7c00) && waited2 < 600) {
+            wait(5);
+            waited2 += 5;
+            cfd = wtFd(cwin);
+            dot = ((global "k.mem %var(cfd)" as list)[11] as str).trim(11, 11);
+        }
+        wlCheck("rv window click paints", dot, p15Glyph(0x7c00));
+        allPlayers.sendMessage("WLTEST NOTE rv window up");
+        wait(60);
+        // Its close box: the program sees xdg_toplevel.close and exits.
+        var.purgeMatching("rv.stats window", matchRequirement="Entire name");
+        wtClickAt([cx + wtGet(cwin, "w") - 4, cy - 5]);
+        waited2 = 0;
+        while (!var.exists(global "rv.stats window") && waited2 < 600) {
+            wait;
+            waited2 += 1;
+        }
+        line ended: num = 0;
+        if (var.exists(global "rv.stats window")) {
+            ended = 1;
+        }
+        wlCheck("rv window exits on close", ended, 1);
+        wlCheck("rv window said goodbye", global "rv.out window", "window up\nwindow closed\n");
+    }
+
     allPlayers.sendMessage("WLTEST NOTE shell up");
     wait(60);
     global "shell.bg" = savedBg;

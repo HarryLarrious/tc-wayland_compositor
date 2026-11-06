@@ -1,11 +1,46 @@
-// cpu.tc: keeps long-running code under a CPU budget.
+// cpu.tc: keeps long-running code under DF's CPU limits. LagSlayer stops a
+// codeline that uses too much CPU, and game.cpuUsage is the plot's use in
+// percent (about 24 ms of code a tick is 100%).
 
 declare local "gen.last_instant": num;
+/** The tick cpuGuard is counting, and when its count started (microseconds). */
+declare local "cpu.tick": num;
+declare local "cpu.start": num;
+
+/** Microseconds a thread may run each tick before cpuGuard makes it wait (about 8% of the plot's CPU). */
+function cpuSlice(): num {
+    return 2000;
+}
+
+/** Plot CPU use (percent) above which every guarded loop waits a tick per step. */
+function cpuPlotMax(): num {
+    return 50;
+}
+
+/**
+ * The CPU limiter: call it on every pass of a loop that can run long. It
+ * counts this thread's time from its first call each tick and waits a tick
+ * once that passes cpuSlice(), or while the whole plot is above
+ * cpuPlotMax(). The first call in a tick never waits, so every loop makes
+ * progress.
+ */
+function cpuGuard {
+    line tick: num = game.ticksSinceStartup;
+    if (local "cpu.tick" != tick) {
+        local "cpu.tick" = tick;
+        local "cpu.start" = game.microsecondsSinceStartup;
+    } else if (game.microsecondsSinceStartup - local "cpu.start" >= cpuSlice() || game.cpuUsage > cpuPlotMax()) {
+        wait;
+        local "cpu.tick" = game.ticksSinceStartup;
+        local "cpu.start" = game.microsecondsSinceStartup;
+    }
+}
 
 /**
  * Waits a tick once this thread has run for long enough since its last wait.
  * maxCpu is 0-100; the time allowed per tick shrinks as more players
- * (up to 8) are on the plot. Call it often inside heavy loops.
+ * (up to 8) are on the plot. Call it often inside heavy loops. The
+ * benchmarks use it; everything else uses cpuGuard.
  */
 function cpuYield(maxCpu: num) {
     line delta: num = game.microsecondsSinceStartup - local "gen.last_instant";

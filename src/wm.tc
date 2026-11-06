@@ -321,6 +321,7 @@ function wmShow(c: num, id: num, damage: list) {
     }
     line i: num = 1;
     while (i + 3 <= damage.len()) {
+        cpuGuard();
         line y0: num = num.max(0, damage[i + 1] as num);
         line y1: num = num.min(h - 1, (damage[i + 1] as num) + (damage[i + 3] as num) - 1);
         if (y1 >= y0) {
@@ -349,6 +350,7 @@ function wmCreateDisplays(c: num, id: num) {
     line w: num = st["w"] as num;
     line uuids: list[str] = list.create() as list[str];
     repeat (st["bands"] as num) {
+        cpuGuard();
         game.spawnTextDisplay(global "s.desk"["eye"] as loc, s" ");
         wmSetupDisplay(w * 2 + 10, st["bandRows"] as num);
         uuids.append(lastEntity.uuid);
@@ -436,6 +438,7 @@ function wmPlace(c: num, id: num) {
     line bandRows: num = st["bandRows"] as num;
     line uuids: list[str] = st["displays"] as list[str];
     repeat (line b to uuids.len()) {
+        cpuGuard();
         line top: num = (b - 1) * bandRows;
         wmMove(uuids[b] as str, wmAt(wx, wy + top, w, num.min(bandRows, h - top), z));
     }
@@ -458,6 +461,7 @@ function wmPlace(c: num, id: num) {
 function wmPlaceAll {
     line windows: list[str] = global "s.windows";
     for (line key of windows) {
+        cpuGuard();
         line parts: list = (key as str).split(":");
         wmPlace(num.parse(parts[1] as str), num.parse(parts[2] as str));
     }
@@ -484,6 +488,7 @@ function wmRemoveDisplays(c: num, id: num) {
         ents.append(st["deco"] as str, st["grip"] as str);
     }
     for (line uid of ents) {
+        cpuGuard();
         select entitiesByUUID(uid as str);
         selectedEntity.remove();
         select reset;
@@ -653,6 +658,7 @@ function wmShellSync {
     global "s.shellSent" = now;
     line shells: list[str] = global "s.shells";
     for (line sk of shells) {
+        cpuGuard();
         line sp: list = (sk as str).split(":");
         line c: num = num.parse(sp[1] as str);
         line id: num = num.parse(sp[2] as str);

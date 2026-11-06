@@ -17,7 +17,7 @@ function shellMenuW(): num {
 }
 
 function shellMenuH(): num {
-    return 156;
+    return (shellSwatchRow() + 1) * shellRowH();
 }
 
 function shellRowH(): num {
@@ -37,9 +37,18 @@ function shellBtnStep(): num {
     return 84;
 }
 
-/** Apps the menu starts, top to bottom. */
+/** Apps the menu starts, top to bottom (window is the C program rv/window.c, on the RISC-V runner). */
 function shellApps(): list[str] {
-    return ["info", "simple", "paint", "terminal"];
+    return ["info", "simple", "paint", "terminal", "window"];
+}
+
+/** Menu rows: the "Windows" header is after the apps; the "Desktop" header and the swatches follow the window rows. */
+function shellWinRow(): num {
+    return shellApps().len() + 1;
+}
+
+function shellSwatchRow(): num {
+    return shellWinRow() + shellMenuWindows() + 2;
 }
 
 /** Desktop colors the menu offers. */
@@ -86,6 +95,7 @@ function shellDrawBar(fd: num, w: num, order: list[num], titles: dict, states: d
     }
     line i: num = 0;
     for (line handle of order) {
+        cpuGuard();
         line x: num = shellBtnX() + i * shellBtnStep();
         if (x + shellBtnStep() - 2 <= w) {
             line k: str = "%var(handle)";
@@ -122,9 +132,10 @@ function shellMenuRow(fd: num, row: num, text: str, header: num) {
 }
 
 /**
- * Draws the start menu. Rows (12 pixels each): 0 "Apps", 1-4 the apps,
- * 5 "Windows", 6-10 open windows (an x on the right closes one), 11
- * "Desktop", 12 the color swatches (the current one framed).
+ * Draws the start menu. Rows (12 pixels each): 0 "Apps", then the apps,
+ * "Windows" (shellWinRow), the open windows (an x on the right closes
+ * one), "Desktop", and the color swatches (shellSwatchRow; the current
+ * one framed).
  */
 function shellDrawMenu(fd: num, order: list[num], titles: dict, bg: num) {
     shellMenuRow(fd, 0, "Apps", 1);
@@ -132,10 +143,11 @@ function shellDrawMenu(fd: num, order: list[num], titles: dict, bg: num) {
     repeat (line i to apps.len()) {
         shellMenuRow(fd, i, apps[i] as str, 0);
     }
-    shellMenuRow(fd, 5, "Windows", 1);
+    shellMenuRow(fd, shellWinRow(), "Windows", 1);
     line red: str = p15Color(0xE03020);
     repeat (line i to shellMenuWindows()) {
-        line row: num = 5 + i;
+        cpuGuard();
+        line row: num = shellWinRow() + i;
         if (i <= order.len()) {
             line handle: num = order[i] as num;
             line k: str = "%var(handle)";
@@ -148,15 +160,15 @@ function shellDrawMenu(fd: num, order: list[num], titles: dict, bg: num) {
             shellMenuRow(fd, row, "", 0);
         }
     }
-    shellMenuRow(fd, 11, "Desktop", 1);
-    shellMenuRow(fd, 12, "", 0);
+    shellMenuRow(fd, shellSwatchRow() - 1, "Desktop", 1);
+    shellMenuRow(fd, shellSwatchRow(), "", 0);
     line swatches: list[num] = shellSwatches();
     repeat (line i to swatches.len()) {
         line x: num = (i - 1) * 14;
         if (swatches[i] as num == bg) {
-            p15Fill(fd, x, 12 * shellRowH(), 14, 12, p15Color(0xFFFFFF));
+            p15Fill(fd, x, shellSwatchRow() * shellRowH(), 14, 12, p15Color(0xFFFFFF));
         }
-        p15Fill(fd, x + 2, 12 * shellRowH() + 2, 10, 8, p15Color(swatches[i] as num));
+        p15Fill(fd, x + 2, shellSwatchRow() * shellRowH() + 2, 10, 8, p15Color(swatches[i] as num));
     }
 }
 
@@ -255,17 +267,17 @@ process appShell {
                 } else if (over == menu["surface"] as num && menuOpen == 1) {
                     line row: num = num.floor(my / shellRowH());
                     line close: num = 1;
-                    if (row >= 1 && row <= 4) {
+                    if (row >= 1 && row < shellWinRow()) {
                         line apps: list[str] = shellApps();
                         wlcReq(c, sh, "launch", [apps[row]]);
-                    } else if (row >= 6 && row <= 5 + shellMenuWindows() && row - 5 <= order.len()) {
-                        line handle: num = order[row - 5] as num;
+                    } else if (row > shellWinRow() && row <= shellWinRow() + shellMenuWindows() && row - shellWinRow() <= order.len()) {
+                        line handle: num = order[row - shellWinRow()] as num;
                         if (mx >= shellMenuW() - 12) {
                             wlcReq(c, sh, "close", [handle]);
                         } else {
                             wlcReq(c, sh, "activate", [handle]);
                         }
-                    } else if (row == 12) {
+                    } else if (row == shellSwatchRow()) {
                         line swatch: num = num.floor(mx / 14) + 1;
                         line swatches: list[num] = shellSwatches();
                         if (swatch <= swatches.len()) {

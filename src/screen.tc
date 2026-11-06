@@ -51,7 +51,7 @@ function scrCard(w: num, h: num): list[str] {
             parts.append(p15Color((r << 16) + (g << 8) + 255 - r));
         }
         rows.append(parts.join(""));
-        cpuYield(40);
+        cpuGuard();
     }
     // Checkerboards: one-pixel black and white on the left, 8-pixel red and blue on the right.
     line white: str = p15Color(0xFFFFFF);

@@ -9,7 +9,7 @@
 /** Processes still to start: app names, read by the next app process (one per start). */
 declare global "app.queue": list[str];
 
-/** Starts app `name` (info, simple, paint or term); returns 0 for an unknown name. */
+/** Starts app `name` (info, simple, paint, terminal, or a RISC-V program from rv/); returns 0 for an unknown name. */
 function appLaunch(name: str): num {
     if (name == "info") {
         start appInfo;
@@ -20,7 +20,8 @@ function appLaunch(name: str): num {
     } else if (name == "terminal") {
         start appTerm;
     } else {
-        return 0;
+        // A C program on the RISC-V runner (rv.tc), if there is one by that name.
+        return rvLaunch(name);
     }
     return 1;
 }
@@ -94,7 +95,7 @@ function simpleBgRows(w: num, h: num): list[str] {
             row.append(p15Color(simpleBg(x - 1, y - 1)));
         }
         bg.append(row.join(""));
-        cpuYield(30);
+        cpuGuard();
     }
     return bg;
 }
@@ -373,7 +374,7 @@ process appTerm {
                         text = screen[r] as str;
                     }
                     termRow(fd, r - 1, text, pat, cols, w, bg);
-                    cpuYield(30);
+                    cpuGuard();
                 }
                 wlcPresent(c, win, [0, 0, w, h]);
             } else {
@@ -402,7 +403,7 @@ function termRun(c: num, input: str): list[str] {
     if (cmd == "") {
         return list.create() as list[str];
     } else if (cmd == "help") {
-        return ["help clear exit", "echo ps uptime", "run info|simple", "  paint|terminal"];
+        return ["help clear exit", "echo ps uptime", "run info|simple", "  paint|terminal", "C: hello|bench", "  isa|window"];
     } else if (cmd == "clear") {
         return ["#clear#"];
     } else if (cmd == "exit") {
