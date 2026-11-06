@@ -22,7 +22,7 @@ declare global "s.kbds %var(c)": list[num];
 
 /** The globals the compositor offers: [name, interface, version]. */
 function wlsGlobals(): list {
-    return [[1, "wl_compositor", 4], [2, "wl_shm", 1], [3, "wl_seat", 1], [4, "wl_output", 1], [5, "xdg_wm_base", 1]];
+    return [[1, "wl_compositor", 4], [2, "wl_shm", 1], [3, "wl_seat", 1], [4, "wl_output", 1], [5, "xdg_wm_base", 1], [6, "df_shell", 1]];
 }
 
 /** wl_shm formats offered: argb8888, xrgb8888, rgb332 ("RGB8") and p15 glyph rows ("DF15", font.tc). */
@@ -98,6 +98,7 @@ process wlServer {
         }
         wlsReap();
         wmInput();
+        wmShellSync();
         wmRender(1500);
         wait;
     }
@@ -147,6 +148,19 @@ function wlsDropConn(c: num) {
     if (var.exists(global "s.objs %var(c)")) {
         for (line id, line iface of global "s.objs %var(c)") {
             var.purgeMatching("s.o %var(c) %var(id)", matchRequirement="Entire name");
+        }
+    }
+    line panels: list[str] = global "s.panels";
+    for (line key of panels) {
+        line parts: list = (key as str).split(":");
+        if (num.parse(parts[1] as str) == c) {
+            wmUnmap(c, num.parse(parts[2] as str));
+        }
+    }
+    line shells: list[str] = global "s.shells";
+    for (line key of shells) {
+        if (num.parse((key as str).split(":")[1] as str) == c) {
+            global "s.shells".removeValue(key);
         }
     }
     var.purgeMatching("s.objs %var(c)", "s.ptrs %var(c)", "s.kbds %var(c)", matchRequirement="Entire name");
@@ -263,6 +277,17 @@ function wlsRequest(c: num, obj: num, iface: str, name: str, args: list) {
             wlsPut(c, surf, "role", "");
             wlsDestroy(c, obj);
         }
+    } else if (iface == "df_shell") {
+        wlsShell(c, obj, name, args);
+    } else if (iface == "df_panel") {
+        if (name == "destroy") {
+            line psurf: num = wlsGet(c, obj, "surface") as num;
+            if (wlsIface(c, psurf) == "wl_surface") {
+                wmUnmap(c, psurf);
+                wlsPut(c, psurf, "role", "");
+            }
+            wlsDestroy(c, obj);
+        }
     } else if (name == "destroy" || name == "release") {
         // wl_region, wl_buffer, wl_pointer, wl_keyboard, wl_output: nothing else to free.
         if (iface == "wl_pointer") {
@@ -299,6 +324,9 @@ function wlsBind(c: num, name: num, iface: str, version: num, id: num) {
         wlsSend(c, id, "wl_output", "geometry", [0, 0, 400, 225, 0, "DiamondFire", "screen canvas", 0]);
         // current | preferred, 20 Hz (one frame per tick)
         wlsSend(c, id, "wl_output", "mode", [3, wmCanvasW(), wmCanvasH(), 20000]);
+    } else if (iface == "df_shell") {
+        global "s.shells".append("%var(c):%var(id)");
+        wmShellSend(c, id);
     }
 }
 
@@ -342,6 +370,16 @@ function wlsCommit(c: num, id: num) {
     line damage: list = st["pDamage"] as list;
     st["pDamage"] = list.create();
     global "s.o %var(c) %var(id)" = st;
+    if (st["role"] as str == "panel") {
+        // Panels map with a buffer and unmap with none; there is no configure to ack.
+        if (st["buf"] as num > 0) {
+            wmShow(c, id, damage);
+        } else {
+            wmUnmap(c, id);
+            wlsPresented(c, id);
+        }
+        return;
+    }
     if (st["role"] as str != "toplevel") {
         // Not shown: release the buffer and run frame callbacks now.
         wlsPresented(c, id);
@@ -382,5 +420,40 @@ function wlsPresented(c: num, id: num) {
             wlsDestroy(c, cb as num);
         }
         wlsPut(c, id, "frames", list.create());
+    }
+}
+
+/** Handles a df_shell request: panels for the shell's own surfaces, and managing other clients' windows by handle. */
+function wlsShell(c: num, obj: num, name: str, args: list) {
+    if (name == "get_panel") {
+        line panel: num = args[1] as num;
+        line surf: num = args[2] as num;
+        line role: num = args[3] as num;
+        if (role < 0 || role > 2 || wlsGet(c, surf, "role") as str != "") {
+            wlsError(c, obj, 0, "bad panel role %var(role)");
+            return;
+        }
+        wlsAdd(c, panel, "df_panel", {surface: surf});
+        wlsPut(c, surf, "role", "panel");
+        wlsPut(c, surf, "panel", role);
+        line size: list[num] = wmPanelSize(role);
+        wlsSend(c, panel, "df_panel", "configure", [size[1], size[2]]);
+    } else if (name == "launch") {
+        appLaunch(args[1] as str);
+    } else {
+        line key: str = wmHandleKey(args[1] as num);
+        if (key == "") {
+            return;
+        }
+        if (name == "activate") {
+            wmActivate(key);
+        } else if (name == "minimize") {
+            wmMinimize(key);
+        } else if (name == "close") {
+            line p: list = key.split(":");
+            line wc: num = num.parse(p[1] as str);
+            line wid: num = num.parse(p[2] as str);
+            wlsSend(wc, wlsGet(wc, wid, "top") as num, "xdg_toplevel", "close", list.create());
+        }
     }
 }

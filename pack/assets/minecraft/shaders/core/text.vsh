@@ -16,6 +16,11 @@
 //     kind A7: the cursor: placed at the camera's look point (4 canvas pixels
 //          per degree from yaw 0, pitch 0, the server's mapping too), in
 //          front of everything; pure black pixels are clear.
+//     kind A8: a full-width strip, opaque, placed like A5 but with x
+//          stretched about the display's centre so it spans the whole
+//          window, however wide: a few glyphs per row, straddling x = 0,
+//          become rows of one color edge to edge (the desktop background
+//          and the taskbar's ends).
 
 #if !defined(IS_GUI) && !defined(IS_SEE_THROUGH)
 #include <minecraft:fog.glsl>
@@ -72,7 +77,7 @@ void main() {
     spriteKey = 0.0;
     // Tagged wl:px glyphs carry pixel data in the color, so the marker is two
     // exact bytes; one tagged pixel color in 65,536 would be misread.
-    if (mark.r == 250 && mark.g > 0 && mark.b >= 165 && mark.b <= 167) {
+    if (mark.r == 250 && mark.g > 0 && mark.b >= 165 && mark.b <= 168) {
         canvas = true;
         float canvasH = 2.0 * float(mark.g);
         // The text renderer puts an even-width line's glyph edges half a canvas
@@ -85,6 +90,11 @@ void main() {
             gl_Position = wl_canvas_position(floor(point + local + 0.5), canvasH, 0.1);
         } else {
             spriteKey = mark.b == 166 ? 1.0 : 0.0;
+            if (mark.b == 168) {
+                // Every glyph edge but one at x = 0 lands far off screen; the
+                // quads either side of x = 0 cover the window from edge to edge.
+                local.x *= 4096.0;
+            }
             gl_Position = wl_canvas_position(floor(local + 0.5), canvasH, 0.25 - clamp(Position.z, 0.0, 0.1));
         }
     }

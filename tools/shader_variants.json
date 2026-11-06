@@ -41,6 +41,42 @@
       ],
       "values": {},
       "oit": true
+    },
+    "minecraft:core/entity": {
+      "flags": [
+        "PER_FACE_LIGHTING",
+        "EMISSIVE",
+        "NO_OVERLAY",
+        "NO_CARDINAL_LIGHTING",
+        "DISSOLVE",
+        "APPLY_TEXTURE_MATRIX",
+        "GLINT"
+      ],
+      "values": {
+        "ALPHA_CUTOUT": [
+          null,
+          "0.1"
+        ]
+      },
+      "oit": true
+    },
+    "minecraft:core/item": {
+      "flags": [
+        "GLINT",
+        "GLINT_SPECIAL"
+      ],
+      "values": {
+        "ALPHA_CUTOUT": [
+          null,
+          "0.1"
+        ]
+      },
+      "oit": true
+    },
+    "minecraft:core/position_tex_color": {
+      "flags": [],
+      "values": {},
+      "oit": false
     }
   }
 }

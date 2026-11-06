@@ -29,10 +29,11 @@ function wmCost(glyphs: num): num {
     return glyphs / 5;
 }
 
-/** Redraws marked bands and title bars, at most about `budget` units (wmCost) this tick. */
+/** Redraws marked bands and title bars of windows and panels, at most about `budget` units (wmCost) this tick. */
 function wmRender(budget: num) {
     line left: num = budget;
     line windows: list[str] = global "s.windows";
+    windows.appendList(global "s.panels");
     for (line key of windows) {
         line p: list = (key as str).split(":");
         line c: num = num.parse(p[1] as str);

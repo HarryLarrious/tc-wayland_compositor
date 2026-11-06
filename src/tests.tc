@@ -186,6 +186,46 @@ function wtWaitWindows(n: num, ticks: num) {
     }
 }
 
+/** 1 if a and b differ, else 0. */
+function wtDiffers(a: any, b: any): num {
+    if (a != b) {
+        return 1;
+    }
+    return 0;
+}
+
+/** Waits up to `ticks` ticks for n panels (shell surfaces) to be mapped. */
+function wtWaitPanels(n: num, ticks: num) {
+    line waited: num = 0;
+    while (global "s.panels".len() != n && waited < ticks) {
+        wait;
+        waited += 1;
+    }
+}
+
+/** Canvas point of start menu row `row` (0-based, 12 pixels each) at x pixels from the menu's left. */
+function wtMenuAt(x: num, row: num): list[num] {
+    line top: num = wmCanvasH() / 2 - wmTaskbarH() - shellMenuH();
+    return [0 - wmCanvasW() / 2 + x, top + row * shellRowH() + 6];
+}
+
+/** Clicks canvas point at = [x, y]. */
+function wtClickAt(at: list[num]) {
+    wtAim(at[1] as num, at[2] as num);
+    wtClick();
+}
+
+/** Clicks the taskbar's home button. */
+function wtHome {
+    wtClickAt([0 - wmCanvasW() / 2 + 10, wmCanvasH() / 2 - 6]);
+}
+
+/** The first pixel of the shell's background buffer. */
+function wtBgPixel(): str {
+    line fd: num = wtFd(wmPanelKey(0));
+    return (global "k.mem %var(fd)" as list)[1] as str;
+}
+
 /** The join tests: codec checks, the compositor and its apps end to end, and the canvas card. */
 process wlAutoTest {
     allPlayers.sendMessage("WLTEST BEGIN");
@@ -204,11 +244,30 @@ process wlAutoTest {
         hasCursor = 1;
     }
     wlCheckTrue("desk cursor", hasCursor);
+    line savedBg: num = global "shell.bg";
+
+    // The desktop flag the shaders read to hide the hand and hotbar: the seat
+    // puts the camera at block fraction (0.123, 0.456) (wl:desktop.glsl).
+    select playersByName(global "test.player");
+    line at: loc = selected.location;
+    select reset;
+    line flag: num = 0;
+    if (num.abs(at.x - num.floor(at.x) - 0.123) < 0.002 && num.abs(at.z - num.floor(at.z) - 0.456) < 0.002) {
+        flag = 1;
+    }
+    wlCheckTrue("desk seat at the shader flag", flag);
+
+    // The shell puts up the background and the taskbar (df_shell panels).
+    wtWaitPanels(2, 200);
+    wlCheck("shell panels mapped", global "s.panels".len(), 2);
+    wlCheck("shell taskbar mapped", wtDiffers(wmPanelKey(1), ""), 1);
+    wlCheck("shell background color", wtBgPixel(), p15Color(global "shell.bg"));
+    wlCheck("hit empty desktop is the background", wmHit(310, -170)[1], wmPanelKey(0));
 
     // A bare client sees the five globals and the p15 format.
     line c: num = wlcConnect("e2e");
     wlcRoundtrip(c);
-    wlCheck("e2e globals", global "cl.globals %var(c)".len(), 5);
+    wlCheck("e2e globals", global "cl.globals %var(c)".len(), 6);
     line shm: num = wlcBind(c, "wl_shm", 1);
     wlcRoundtrip(c);
     line hasP15: num = 0;
@@ -221,9 +280,18 @@ process wlAutoTest {
     wlCheck("e2e shm offers p15", hasP15, 1);
     wlcClose(c);
 
+    // The home button opens the start menu; its paint entry starts paint and closes it.
+    wtHome();
+    wtWaitPanels(3, 60);
+    wlCheck("home opens the start menu", wtDiffers(wmPanelKey(2), ""), 1);
+    wtClickAt(wtMenuAt(30, 3));
+    wtWaitWindows(1, 300);
+    wlCheck("menu starts paint", wtDiffers(wtWindow("paint"), ""), 1);
+    wtWaitPanels(2, 60);
+    wlCheck("menu closes after starting", wmPanelKey(2), "");
+
     // The apps map their windows and the compositor presents them.
     appLaunch("simple");
-    appLaunch("paint");
     appLaunch("terminal");
     wtWaitWindows(3, 400);
     wlCheck("e2e three windows mapped", wtWindows(), 3);
@@ -233,6 +301,25 @@ process wlAutoTest {
         waited += 1;
     }
     wlCheck("e2e windows presented", wtPending(), 0);
+    wlCheck("shell told of three windows", global "s.shellSent".len(), 3);
+
+    // Taskbar: paint's button is first (oldest). Click: focus; again: minimize; again: back.
+    line paintKey: str = wtWindow("paint");
+    if (paintKey != "") {
+        line paintBtn: list[num] = [0 - wmCanvasW() / 2 + shellBtnX() + 20, wmCanvasH() / 2 - 6];
+        wtClickAt(paintBtn);
+        wait(3);
+        wlCheck("taskbar focuses", global "s.focus", paintKey);
+        wtClickAt(paintBtn);
+        wait(3);
+        wlCheck("taskbar minimizes the focused window", wtGet(paintKey, "min"), 1);
+        wlCheck("focus leaves a minimized window", wtDiffers(global "s.focus", paintKey), 1);
+        wlCheck("minimized window not hit", wtDiffers(wmHit(wtGet(paintKey, "wx") + 5, wtGet(paintKey, "wy") + 5)[1], paintKey), 1);
+        wtClickAt(paintBtn);
+        wait(3);
+        wlCheck("taskbar restores", wtGet(paintKey, "min"), 0);
+        wlCheck("restored window focused", global "s.focus", paintKey);
+    }
 
     // Keyboard: a typed line reaches the terminal, which echoes it.
     line term: str = wtWindow("terminal");
@@ -339,14 +426,37 @@ process wlAutoTest {
             moved = 1;
         }
         wlCheckTrue("e2e simple animates", moved);
-        // The close box: the client exits and its window goes.
-        line sp: list = simple.split(":");
-        line sc: num = num.parse(sp[1] as str);
-        line sid: num = num.parse(sp[2] as str);
-        wlsSend(sc, wlsGet(sc, sid, "top") as num, "xdg_toplevel", "close", list.create());
+        // The menu lists windows oldest first; the x on simple's row closes it.
+        line handle: num = wtGet(simple, "handle");
+        line index: num = 0;
+        for (line h of global "s.shellSent") {
+            if (h as num <= handle) {
+                index += 1;
+            }
+        }
+        wtHome();
+        wtWaitPanels(3, 60);
+        wtClickAt(wtMenuAt(shellMenuW() - 6, 5 + index));
         wtWaitWindows(2, 100);
-        wlCheck("e2e simple closed", wtWindows(), 2);
+        wlCheck("menu closes simple", wtWindows(), 2);
+        wlCheck("menu closes after closing a window", wmPanelKey(2), "");
     }
+
+    // The menu's swatches set the desktop color; the last is 3060a0.
+    wtHome();
+    wtWaitPanels(3, 60);
+    wtClickAt(wtMenuAt(7 * 14 + 7, 12));
+    wait(3);
+    wlCheck("swatch sets the desktop color", global "shell.bg", 0x3060A0);
+    wait(5);
+    wlCheck("background shows the color", wtBgPixel(), p15Color(0x3060A0));
+    // A click on the desktop closes the menu.
+    wtClickAt([310, -170]);
+    wtWaitPanels(2, 60);
+    wlCheck("desktop click closes the menu", wmPanelKey(2), "");
+    allPlayers.sendMessage("WLTEST NOTE shell up");
+    wait(60);
+    global "shell.bg" = savedBg;
     wmStop();
 
     // Canvas: the card's size, every band under DF's 10,000-character limit,

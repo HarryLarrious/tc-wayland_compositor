@@ -1,0 +1,312 @@
+// shell.tc: the desktop shell, a Wayland client like the apps. It talks to
+// the compositor through wlc.tc and df_shell (protocol/df-shell.xml) and owns
+// three panels, surfaces with no title bar that the compositor keeps in place:
+//   background  one pixel of the desktop color, stretched under every window
+//   taskbar     along the bottom: the home button, then a button per window
+//               (click: focus it; click the focused one: minimize it)
+//   start menu  above the home button while open: start apps, focus or
+//               close running windows, pick the desktop color
+// wmStart starts it with the compositor.
+
+/** The desktop color, 0xRRGGBB (black to start). The menu's swatches and @wl bg set it. */
+declare global "shell.bg": num;
+
+/** Start menu size and row height in pixels. */
+function shellMenuW(): num {
+    return 112;
+}
+
+function shellMenuH(): num {
+    return 156;
+}
+
+function shellRowH(): num {
+    return 12;
+}
+
+/** Taskbar layout: home button width, then window buttons from x shellBtnX() every shellBtnStep() pixels. */
+function shellHomeW(): num {
+    return 22;
+}
+
+function shellBtnX(): num {
+    return 26;
+}
+
+function shellBtnStep(): num {
+    return 84;
+}
+
+/** Apps the menu starts, top to bottom. */
+function shellApps(): list[str] {
+    return ["info", "simple", "paint", "terminal"];
+}
+
+/** Desktop colors the menu offers. */
+function shellSwatches(): list[num] {
+    return [0x000000, 0x101848, 0x104848, 0x184018, 0x481018, 0x301048, 0x303030, 0x3060A0];
+}
+
+/** Windows the menu lists (rows 7 to 11). */
+function shellMenuWindows(): num {
+    return 5;
+}
+
+/** A panel: a new surface with df_shell role `role` and a w x h p15 buffer. Returns {surface, panel, buf, fd, pool, stride, w, h}. */
+function shellPanel(c: num, comp: num, shm: num, sh: num, role: num, w: num, h: num): dict {
+    line surf: num = wlcNew(c, "wl_surface");
+    wlcReq(c, comp, "create_surface", [surf]);
+    line panel: num = wlcNew(c, "df_panel");
+    wlcReq(c, sh, "get_panel", [panel, surf, role]);
+    line p: dict = {surface: surf, panel: panel, w: w, h: h};
+    p.append(wlcBuffer(c, shm, w, h, p15Format()));
+    return p;
+}
+
+/** The home button's house, white on the button; "." is the button color. */
+function shellHouse(): list[str] {
+    return ["....X.....", "...XXX....", "..XXXXX...", ".XXXXXXX..", "XXXXXXXXX.", ".XXX.XXX..", ".XXX.XXX..", ".XXX.XXX.."];
+}
+
+/** Draws the taskbar: the home button (lit while the menu is open) and one button per window, in handle order. */
+function shellDrawBar(fd: num, w: num, order: list[num], titles: dict, states: dict, menuOpen: num) {
+    line h: num = wmTaskbarH();
+    p15Fill(fd, 0, 0, w, h, p15Color(0x202028));
+    line home: num = 0x2050C0;
+    if (menuOpen == 1) {
+        home = 0x4080F0;
+    }
+    line homeG: str = p15Color(home);
+    p15Fill(fd, 0, 0, shellHomeW(), h, homeG);
+    line white: str = p15Color(0xFFFFFF);
+    line art: list[str] = shellHouse();
+    repeat (line y to art.len()) {
+        line r: str = (art[y] as str).replace(".", homeG).replace("X", white);
+        global "k.mem %var(fd)"[y + 2] = p15Splice(global "k.mem %var(fd)"[y + 2] as str, 6, r);
+    }
+    line i: num = 0;
+    for (line handle of order) {
+        line x: num = shellBtnX() + i * shellBtnStep();
+        if (x + shellBtnStep() - 2 <= w) {
+            line k: str = "%var(handle)";
+            line state: num = states[k] as num;
+            line bg: num = 0x404050;
+            line fg: num = 0xFFFFFF;
+            if ((state & 2) == 2) {
+                bg = 0x2C2C34;
+                fg = 0x909098;
+            } else if ((state & 1) == 1) {
+                bg = 0x5068B0;
+            }
+            line bgG: str = p15Color(bg);
+            p15Fill(fd, x, 1, shellBtnStep() - 2, h - 2, bgG);
+            p15Text(fd, x + 4, 2, (titles[k] as str).trim(1, 9), p15Color(fg), bgG);
+        }
+        i += 1;
+    }
+}
+
+/** Draws one menu row of text from the left edge (header rows on the accent color). */
+function shellMenuRow(fd: num, row: num, text: str, header: num) {
+    line bg: num = 0x282830;
+    line fg: num = 0xE0E0E0;
+    if (header == 1) {
+        bg = 0x2050C0;
+        fg = 0xFFFFFF;
+    }
+    line bgG: str = p15Color(bg);
+    p15Fill(fd, 0, row * shellRowH(), shellMenuW(), shellRowH(), bgG);
+    if (text != "") {
+        p15Text(fd, 4, row * shellRowH() + 2, text, p15Color(fg), bgG);
+    }
+}
+
+/**
+ * Draws the start menu. Rows (12 pixels each): 0 "Apps", 1-4 the apps,
+ * 5 "Windows", 6-10 open windows (an x on the right closes one), 11
+ * "Desktop", 12 the color swatches (the current one framed).
+ */
+function shellDrawMenu(fd: num, order: list[num], titles: dict, bg: num) {
+    shellMenuRow(fd, 0, "Apps", 1);
+    line apps: list[str] = shellApps();
+    repeat (line i to apps.len()) {
+        shellMenuRow(fd, i, apps[i] as str, 0);
+    }
+    shellMenuRow(fd, 5, "Windows", 1);
+    line red: str = p15Color(0xE03020);
+    repeat (line i to shellMenuWindows()) {
+        line row: num = 5 + i;
+        if (i <= order.len()) {
+            line handle: num = order[i] as num;
+            line k: str = "%var(handle)";
+            shellMenuRow(fd, row, (titles[k] as str).trim(1, 11), 0);
+            p15Fill(fd, shellMenuW() - 12, row * shellRowH() + 1, 10, 10, red);
+            p15Text(fd, shellMenuW() - 11, row * shellRowH() + 2, "x", p15Color(0xFFFFFF), red);
+        } else if (i == 1 && order.len() == 0) {
+            shellMenuRow(fd, row, "(none)", 0);
+        } else {
+            shellMenuRow(fd, row, "", 0);
+        }
+    }
+    shellMenuRow(fd, 11, "Desktop", 1);
+    shellMenuRow(fd, 12, "", 0);
+    line swatches: list[num] = shellSwatches();
+    repeat (line i to swatches.len()) {
+        line x: num = (i - 1) * 14;
+        if (swatches[i] as num == bg) {
+            p15Fill(fd, x, 12 * shellRowH(), 14, 12, p15Color(0xFFFFFF));
+        }
+        p15Fill(fd, x + 2, 12 * shellRowH() + 2, 10, 8, p15Color(swatches[i] as num));
+    }
+}
+
+/** Sets the background panel to color bg and commits it. */
+function shellPaintBg(c: num, back: dict, bg: num) {
+    line fd: num = back["fd"] as num;
+    global "k.mem %var(fd)"[1] = p15Color(bg);
+    wlcPresent(c, back, [0, 0, 1, 1]);
+}
+
+/** The desktop shell process: the background, the taskbar and the start menu. */
+process appShell {
+    line run: num = global "wl.alive";
+    fontInit();
+    line c: num = wlcConnect("shell");
+    wlcRoundtrip(c);
+    line comp: num = wlcBind(c, "wl_compositor", 4);
+    line shm: num = wlcBind(c, "wl_shm", 1);
+    line seat: num = wlcBind(c, "wl_seat", 1);
+    line sh: num = wlcBind(c, "df_shell", 1);
+    if (sh == 0) {
+        allPlayers.sendMessage(s"<red>shell: the compositor has no df_shell");
+        wlcClose(c);
+        return;
+    }
+    line ptr: num = wlcNew(c, "wl_pointer");
+    wlcReq(c, seat, "get_pointer", [ptr]);
+    line back: dict = shellPanel(c, comp, shm, sh, 0, 1, 1);
+    line bar: dict = shellPanel(c, comp, shm, sh, 1, wmCanvasW(), wmTaskbarH());
+    line menu: dict = shellPanel(c, comp, shm, sh, 2, shellMenuW(), shellMenuH());
+    line bg: num = global "shell.bg";
+    shellPaintBg(c, back, bg);
+    // Windows by handle: order is the taskbar order, oldest first.
+    line order: list[num] = list.create() as list[num];
+    line titles: dict = {};
+    line states: dict = {};
+    line menuOpen: num = 0;
+    line drawBar: num = 1;
+    line drawMenu: num = 0;
+    line over: num = 0;
+    line mx: num = 0;
+    line my: num = 0;
+    while (wlcAlive(c, run) == 1) {
+        for (line ev of wlcPoll(c)) {
+            line e: list = ev as list;
+            line a: list = e[4] as list;
+            line what: str = (e[2] as str) + "." + (e[3] as str);
+            if (what == "df_shell.window") {
+                line handle: num = a[1] as num;
+                line k: str = "%var(handle)";
+                if (order.find(handle) == 0) {
+                    order.append(handle);
+                    order.sort();
+                }
+                titles[k] = a[2];
+                states[k] = a[3];
+            } else if (what == "df_shell.window_closed") {
+                line gone: num = a[1] as num;
+                order.removeValue(gone);
+                titles.remove("%var(gone)");
+                states.remove("%var(gone)");
+            } else if (what == "df_shell.done") {
+                drawBar = 1;
+                drawMenu = menuOpen;
+            } else if (what == "wl_pointer.enter") {
+                over = a[2] as num;
+                mx = num.floor(a[3] as num);
+                my = num.floor(a[4] as num);
+            } else if (what == "wl_pointer.motion") {
+                mx = num.floor(a[2] as num);
+                my = num.floor(a[3] as num);
+            } else if (what == "wl_pointer.leave") {
+                over = 0;
+            } else if (what == "wl_pointer.button" && a[4] as num == 1 && a[3] as num == 272) {
+                if (over == bar["surface"] as num) {
+                    if (mx < shellHomeW()) {
+                        menuOpen = 1 - menuOpen;
+                        drawMenu = menuOpen;
+                        drawBar = 1;
+                        if (menuOpen == 0) {
+                            wlcReq(c, menu["surface"] as num, "attach", [0, 0, 0]);
+                            wlcReq(c, menu["surface"] as num, "commit", list.create());
+                        }
+                    } else {
+                        line slot: num = num.floor((mx - shellBtnX()) / shellBtnStep()) + 1;
+                        if (mx >= shellBtnX() && slot <= order.len()) {
+                            line handle: num = order[slot] as num;
+                            // The focused window's button minimizes it; any other button brings its window up.
+                            if (states["%var(handle)"] as num == 1) {
+                                wlcReq(c, sh, "minimize", [handle]);
+                            } else {
+                                wlcReq(c, sh, "activate", [handle]);
+                            }
+                        }
+                    }
+                } else if (over == menu["surface"] as num && menuOpen == 1) {
+                    line row: num = num.floor(my / shellRowH());
+                    line close: num = 1;
+                    if (row >= 1 && row <= 4) {
+                        line apps: list[str] = shellApps();
+                        wlcReq(c, sh, "launch", [apps[row]]);
+                    } else if (row >= 6 && row <= 5 + shellMenuWindows() && row - 5 <= order.len()) {
+                        line handle: num = order[row - 5] as num;
+                        if (mx >= shellMenuW() - 12) {
+                            wlcReq(c, sh, "close", [handle]);
+                        } else {
+                            wlcReq(c, sh, "activate", [handle]);
+                        }
+                    } else if (row == 12) {
+                        line swatch: num = num.floor(mx / 14) + 1;
+                        line swatches: list[num] = shellSwatches();
+                        if (swatch <= swatches.len()) {
+                            global "shell.bg" = swatches[swatch];
+                        }
+                        // The menu stays open to try colors.
+                        close = 0;
+                    } else {
+                        close = 0;
+                    }
+                    if (close == 1) {
+                        menuOpen = 0;
+                        drawBar = 1;
+                        wlcReq(c, menu["surface"] as num, "attach", [0, 0, 0]);
+                        wlcReq(c, menu["surface"] as num, "commit", list.create());
+                    }
+                } else if (over == back["surface"] as num && menuOpen == 1) {
+                    // A click on the desktop closes the menu.
+                    menuOpen = 0;
+                    drawBar = 1;
+                    wlcReq(c, menu["surface"] as num, "attach", [0, 0, 0]);
+                    wlcReq(c, menu["surface"] as num, "commit", list.create());
+                }
+            }
+        }
+        if (global "shell.bg" != bg) {
+            bg = global "shell.bg";
+            shellPaintBg(c, back, bg);
+            drawMenu = menuOpen;
+        }
+        if (drawBar == 1) {
+            drawBar = 0;
+            shellDrawBar(bar["fd"] as num, bar["w"] as num, order, titles, states, menuOpen);
+            wlcPresent(c, bar, [0, 0, bar["w"], bar["h"]]);
+        }
+        if (drawMenu == 1) {
+            drawMenu = 0;
+            shellDrawMenu(menu["fd"] as num, order, titles, bg);
+            wlcPresent(c, menu, [0, 0, menu["w"], menu["h"]]);
+        }
+        wait;
+    }
+    wlcClose(c);
+}

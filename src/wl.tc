@@ -3,6 +3,7 @@
 /**
  * @wl start | stop: the compositor: a screen-locked desktop (you sit; your look is the mouse)
  * @wl info | simple | paint | terminal: starts an app (and the compositor if needed)
+ * @wl bg <rrggbb>: the desktop color (black to start)
  * @wl look <x> <y>: points the cursor at canvas pixel (x, y), from the centre (turns you)
  * @wl stats: plot CPU, windows and connections
  * @wl test: runs the self-test
@@ -17,6 +18,13 @@ function wlCommand(parts: list) {
     } else if (sub == "start") {
         wmStart();
         default.sendMessage(s"<gray>Desktop started. Look around to move the mouse; click to click; chat types into the focused window.");
+    } else if (sub == "bg" && parts.len() >= 3) {
+        line color: num = wlHex(parts[3] as str);
+        if (color < 0) {
+            default.sendMessage(s"<red>@wl bg takes a color as 6 hex digits, like 3060a0");
+        } else {
+            global "shell.bg" = color;
+        }
     } else if (sub == "look" && parts.len() >= 4 && wmActive() == 1) {
         // The cursor is 4 canvas pixels per degree (wmCursor).
         default.setRotation(num.parse(parts[4] as str) / 4, num.parse(parts[3] as str) / 4);
@@ -39,7 +47,8 @@ function wlCommand(parts: list) {
         appLaunch(sub);
     } else {
         default.sendMessage(s"<yellow>@wl start</yellow><gray>, </gray><yellow>@wl stop</yellow> <gray>the desktop: you sit, and where you look is the mouse");
-        default.sendMessage(s"<yellow>@wl info|simple|paint|terminal</yellow> <gray>starts an app");
+        default.sendMessage(s"<yellow>@wl info|simple|paint|terminal</yellow> <gray>starts an app (or use the home button on the taskbar)");
+        default.sendMessage(s"<yellow>@wl bg rrggbb</yellow> <gray>sets the desktop color");
         default.sendMessage(s"<yellow>@key enter|back|tab|esc|up|down|left|right</yellow> <gray>types a special key");
         default.sendMessage(s"<gray>Chat goes to the focused window. Click a title bar to move it, the x to close it, the corner grip to resize it.");
     }
@@ -53,4 +62,22 @@ function keyCommand(parts: list) {
             global "s.keys".append([code, 0]);
         }
     }
+}
+
+/** The value of 6 hex digits (an optional leading # is skipped), or -1 if `text` is not one. */
+function wlHex(text: str): num {
+    line t: str = text.replace("#", "");
+    if (t.len() != 6) {
+        return -1;
+    }
+    line value: num = 0;
+    repeat (line i to 6) {
+        // find is 1-based, 0 when missing; upper case sits 16 places on.
+        line at: num = "0123456789abcdef0123456789ABCDEF".find(t.trim(i, i));
+        if (at == 0) {
+            return -1;
+        }
+        value = value * 16 + (at - 1) % 16;
+    }
+    return value;
 }

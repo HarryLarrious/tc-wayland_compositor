@@ -19,6 +19,7 @@ build time.
 | `@wl simple` | Runs **simple**: a window with a bouncing square (like weston-simple-shm). |
 | `@wl paint` | Runs **paint**: a canvas. Click to paint. Type `1`–`8` for a color, `p` to toggle the pen (paint as you look), `c` to clear. |
 | `@wl terminal` | Runs **terminal**: a terminal with a small shell (`help`, `echo`, `ps`, `uptime`, `run <app>`, `clear`, `exit`). |
+| `@wl bg <rrggbb>` | Sets the desktop color (black to start), like the start menu's swatches. |
 | `@wl stop` | Stops the desktop and every app, and lets you off the seat. |
 | `@wl stats` | Prints plot CPU, windows and connections. |
 | `@key <name>` | Types a special key: `enter`, `back`, `tab`, `esc`, `up`, `down`, `left`, `right`. |
@@ -26,13 +27,16 @@ build time.
 | `@wl test` | Runs the kernel and wire self-test (prints `WLTEST` lines). |
 | `@scr <width> <height> [bandRows] [anim]` | Shows a screen-locked test canvas over your whole view (width a multiple of 32; `anim` 1 bounces a square). `@scr stop` removes it. |
 
-Any app command starts the compositor if it isn't running.
+Any app command starts the compositor if it isn't running. On the desktop,
+the home button on the taskbar does the same.
 
 **Tests on join:** when a player with developer or owner access joins, or
 switches to play mode (which every deploy does), `tests.tc` runs:
 - the codec checks;
 - an end-to-end run of the desktop and its apps:
-  - the seat and the cursor;
+  - the seat and the cursor, and the seat at the shaders' desktop flag;
+  - the shell's background and taskbar, the home button opening the start
+    menu, and the menu starting paint;
   - globals and the p15 format;
   - three windows mapped and presented;
   - a typed line echoed by the terminal;
@@ -42,7 +46,9 @@ switches to play mode (which every deploy does), `tests.tc` runs:
   - a window dragged by its title bar;
   - a window resized with its grip (paint keeps its picture, and the
     terminal reflows);
-  - simple animating, and the close box;
+  - taskbar buttons focusing, minimizing and restoring a window;
+  - simple animating, and the menu closing it;
+  - a swatch setting the desktop color, and a desktop click closing the menu;
 - the canvas card, then the card on screen for 5 seconds.
 
 The mouse checks turn the player to aim the cursor, the way looking around
@@ -65,6 +71,22 @@ runs.
   release, since DF only reports clicks).
 - **Keyboard:** chat lines go to the focused window as `wl_keyboard` key
   events, followed by Enter.
+
+**Shell** (`shell.tc`). The desktop is an OS shell around the compositor:
+- **Background:** one solid color, black to start. The start menu's
+  swatches and `@wl bg` change it.
+- **Taskbar:** a static bar along the bottom, with no title bar. The home
+  button (the house) opens and closes the start menu. Then there is one
+  button per window, oldest first. Click a button to bring its window up;
+  click the focused window's button to minimize it.
+- **Start menu:** a static panel above the home button, with no title bar.
+  It starts apps (info, simple, paint, terminal), lists open windows (click
+  one to bring it up, or its red x to close it) and offers desktop colors.
+  Starting or closing something closes the menu, and so does a click on the
+  desktop.
+- **No hand, hotbar or crosshair:** while you sit at the desktop, the pack's
+  shaders don't draw the first-person hand and held item, the hotbar with
+  the hearts, food, armor and XP bars around it, or the crosshair.
 
 **Windows:**
 - Click a window to focus and raise it. The focused window's title bar is
@@ -95,10 +117,10 @@ runs.
 - **Wire** (`wire.tc`, `protocol.tc`). A message is `[object id, size << 16
   | opcode, args...]`. Strings and arrays are their byte length, then the
   bytes packed four to a word. `tools/protocol2tc.py` generates the message
-  signatures from `wayland.xml` and `xdg-shell.xml`.
+  signatures from `wayland.xml`, `xdg-shell.xml` and `protocol/df-shell.xml`.
 - **Compositor** (`server.tc`). It offers `wl_compositor` 4, `wl_shm` 1
   (argb8888, xrgb8888, rgb332 and p15), `wl_seat` 1 (pointer and keyboard),
-  `wl_output` 1 and `xdg_wm_base` 1. Surfaces follow the usual
+  `wl_output` 1, `xdg_wm_base` 1 and `df_shell` 1 (the shell's own). Surfaces follow the usual
   pending/commit model, and toplevels get the initial configure / ack
   handshake. The keymap is format 0 (no_keymap): both ends use the US evdev
   table in `keymap.tc`.
@@ -127,9 +149,30 @@ runs.
   translation puts it on a 360-pixel-tall canvas (40 canvas pixels per
   block, from the screen centre), and its z stacks windows. The text color
   marks canvas glyphs: `#FAB4A5` for windows, `A6` for sprites (pure black
-  is clear) and `A7` for the cursor, which the shader places at the camera's
-  look point every frame. Title bars are small p15 images the compositor
+  is clear), `A7` for the cursor, which the shader places at the camera's
+  look point every frame, and `A8` for full-width strips. Title bars are small p15 images the compositor
   draws with the 8×8 font (`font.tc`, from Lat15-VGA8).
+- **Shell** (`shell.tc`, `protocol/df-shell.xml`). The shell is an ordinary
+  client with one extra global, `df_shell` (like wlr-layer-shell and
+  wlr-foreign-toplevel-management cut down). `get_panel` gives a surface a
+  role, background, taskbar or menu: a panel has no title bar, can't be
+  moved or resized, never takes keyboard focus, maps with a buffer and
+  unmaps with a null one. The compositor tells the shell about every window
+  by handle (`window` with title and focused/minimized state,
+  `window_closed`, `done`), and the shell asks it to `activate`, `minimize`
+  or `close` a window or `launch` an app. Stacking, back to front: the
+  background, the windows, the taskbar, the menu, the resize outline and
+  the cursor. The background and the taskbar's ends are full-width strips
+  (`A8`, below): a few glyphs per row that the shader stretches across the
+  window, so they cost a few hundred glyphs, not 230,000, and fill windows
+  wider than 16:9.
+- **Hiding the hand and HUD** (`wl:desktop.glsl`). The seat sits at block
+  fraction 0.123 in x and 0.456 in z. Every pipeline can read the camera's
+  fraction (`Globals.CameraOffset`), so that is the desktop flag. While it
+  is set, `entity.vsh` and `item.vsh` drop vertices within 2 blocks of the
+  camera (the first-person hand and held item), and `position_tex_color.vsh`
+  drops textured GUI vertices in the bottom-centre HUD area and at the
+  crosshair. Text keeps drawing, so the chat box still works.
 - **Resize** (`wm.tc`, `wlc.tc`). The grip click starts an outline (four
   sprite displays) that follows the cursor; the next click sends
   `xdg_toplevel.configure` and `xdg_surface.configure`. `wlcConfigure` acks
@@ -283,7 +326,9 @@ decoded by `px.glsl`).
 | `src/wire.tc` | Wire format encode and decode |
 | `src/protocol.tc` | Generated message tables (`tools/protocol2tc.py`) |
 | `src/server.tc` | Compositor loop, request dispatch, surfaces, xdg-shell |
-| `src/wm.tc` | Wall, placement, title bars, focus, pointer, keyboard, dragging |
+| `src/wm.tc` | Desktop, placement, title bars, panels, focus, minimize, pointer, keyboard, dragging, resizing, the shell's window list |
+| `src/shell.tc` | The desktop shell: background, taskbar, start menu |
+| `protocol/df-shell.xml` | The shell's protocol, `df_shell` and `df_panel` |
 | `src/render.tc` | Band rendering and presentation |
 | `src/wlc.tc` | Client library |
 | `src/apps.tc` | wayland-info, simple, paint, terminal |
@@ -319,9 +364,11 @@ tools/deploy.sh                                  # place the code on the plot
 The shader check needs `glslc` and the Minecraft 26.3 client jar. After
 publishing, set the printed URL in `packUrl()` (`src/pack.tc`).
 
-This pack overrides `minecraft:core/text`, the same as the mech game's pack.
+This pack overrides `minecraft:core/text`, the same as the mech game's pack,
+and the vertex shaders of `core/entity`, `core/item` and
+`core/position_tex_color` (only while the desktop flag is set).
 This project also defines the `command`, `join`, `resourcePackLoad`,
-`leftClick`, `rightClick` and `chat` events. On a plot shared with the mech
+`leftClick`, `rightClick`, `chat` and `dismount` events. On a plot shared with the mech
 game, the last code and pack sent win.
 
 ## Limits
@@ -341,4 +388,9 @@ game, the last code and pack sent win.
   them in the world.
 - The server assumes a 16:9 window when it clamps the cursor and places
   windows. On wider windows the shader shows more canvas at the sides, so
-  the cursor can't reach the outer edges.
+  the cursor can't reach the outer edges. The taskbar's buttons stay in the
+  16:9 area, and its color runs out to the sides.
+- The taskbar shows 7 window buttons and the start menu lists 5 windows.
+- The hand hiding drops every entity and item vertex within 2 blocks of the
+  camera while you sit at the desktop, so a mob or item that close
+  disappears too. Item counts in the hotbar slots are text and still draw.

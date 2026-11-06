@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="df_shell">
+  <copyright>Part of tc-wayland_compositor.</copyright>
+  <description summary="desktop shell surfaces and window management">
+    The interface a desktop shell client uses to put up its own surfaces
+    (the background, the taskbar and the start menu) and to manage other
+    clients' windows. It is like wlr-layer-shell and
+    wlr-foreign-toplevel-management together, cut down to what this
+    compositor needs.
+  </description>
+
+  <interface name="df_shell" version="1">
+    <description summary="the desktop shell">
+      On bind, and each time the set of windows changes, the compositor sends
+      one window event for each toplevel window and then done.
+    </description>
+
+    <enum name="role">
+      <entry name="background" value="0" summary="below every window; fills the whole output with the buffer's top-left pixel"/>
+      <entry name="taskbar" value="1" summary="along the bottom of the output, above every window"/>
+      <entry name="menu" value="2" summary="above the taskbar at its left end, above everything"/>
+    </enum>
+
+    <enum name="state" bitfield="true">
+      <entry name="focused" value="1"/>
+      <entry name="minimized" value="2"/>
+    </enum>
+
+    <request name="get_panel">
+      <description summary="give a surface a shell role">
+        The surface becomes a panel: it has no title bar and cannot be moved
+        or resized; it is mapped by committing a buffer and unmapped by
+        committing a null one. The compositor sends configure with its size.
+        Pointer events reach it; keyboard focus never does.
+      </description>
+      <arg name="id" type="new_id" interface="df_panel"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="role" type="uint" enum="role"/>
+    </request>
+
+    <request name="activate">
+      <description summary="restore, raise and focus a window"/>
+      <arg name="handle" type="uint"/>
+    </request>
+
+    <request name="minimize">
+      <description summary="hide a window until it is activated"/>
+      <arg name="handle" type="uint"/>
+    </request>
+
+    <request name="close">
+      <description summary="ask a window's client to close it"/>
+      <arg name="handle" type="uint"/>
+    </request>
+
+    <request name="launch">
+      <description summary="start an app by name"/>
+      <arg name="app" type="string"/>
+    </request>
+
+    <event name="window">
+      <description summary="a window was mapped or changed"/>
+      <arg name="handle" type="uint"/>
+      <arg name="title" type="string"/>
+      <arg name="state" type="uint" enum="state"/>
+    </event>
+
+    <event name="window_closed">
+      <arg name="handle" type="uint"/>
+    </event>
+
+    <event name="done">
+      <description summary="the end of a batch of window events"/>
+    </event>
+  </interface>
+
+  <interface name="df_panel" version="1">
+    <request name="destroy" type="destructor"/>
+
+    <event name="configure">
+      <description summary="the panel's size">
+        The size in output pixels. 0 lets the client choose (menu). The
+        background is one solid color, its buffer's top-left pixel, so a
+        1 x 1 buffer is enough. The taskbar's last pixel column is
+        stretched out to the window's sides when the window is wider than
+        the output.
+      </description>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+    </event>
+  </interface>
+</protocol>

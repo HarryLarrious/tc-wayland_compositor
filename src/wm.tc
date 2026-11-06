@@ -15,6 +15,13 @@
 // bar to pick it up and click again to drop it; click the red box to close
 // it; click the grip at its bottom-right corner, move, and click again to
 // resize it (the client gets xdg_toplevel.configure with the new size).
+//
+// The desktop shell (shell.tc) is a client too. Through df_shell
+// (protocol/df-shell.xml) it puts up panels, surfaces with no title bar that
+// stay where their role puts them: the background (one color, stretched
+// under every window), the taskbar and the start menu (above every
+// window). It is told about every window by handle, and can activate,
+// minimize and close windows and launch apps.
 
 /** Window keys "<c>:<surface id>", bottom to top. */
 declare global "s.windows": list[str];
@@ -37,6 +44,16 @@ declare global "s.clicks": list[num];
 declare global "s.keys": list;
 /** Windows mapped so far (places the next one). */
 declare global "s.placed": num;
+/** Mapped panel keys "<c>:<surface id>" (shell surfaces: background, taskbar, menu). */
+declare global "s.panels": list[str];
+/** df_shell bindings "<c>:<id>", told about every window. */
+declare global "s.shells": list[str];
+/** The last window handle given out, and window key by handle (as text). */
+declare global "s.handle": num;
+declare global "s.handles": dict;
+/** 1 when the windows changed since the shells were last told; the handles they were told about. */
+declare global "s.shellDirty": num;
+declare global "s.shellSent": list[num];
 
 /** Title bar height in canvas pixels. */
 function wmDecoH(): num {
@@ -65,7 +82,31 @@ function wmMinH(): num {
     return 32;
 }
 
-/** The color tag that marks canvas text: kind "a5" window, "a6" sprite (black is clear), "a7" cursor. Green is half the canvas height. */
+/** Taskbar height in canvas pixels. */
+function wmTaskbarH(): num {
+    return 12;
+}
+
+/** Stacking depth (text.vsh: 0 to 0.1, larger is nearer) of the windows' top and of each panel role: background, taskbar, menu. */
+function wmTopZ(): num {
+    return 0.08;
+}
+
+function wmPanelZ(role: num): num {
+    return [0, 0.09, 0.095][role + 1] as num;
+}
+
+/** The size df_panel.configure gives a panel role; 0 x 0 lets the client choose. */
+function wmPanelSize(role: num): list[num] {
+    if (role == 0) {
+        return [wmCanvasW(), wmCanvasH()];
+    } else if (role == 1) {
+        return [wmCanvasW(), wmTaskbarH()];
+    }
+    return [0, 0];
+}
+
+/** The color tag that marks canvas text: kind "a5" window, "a6" sprite (black is clear), "a7" cursor, "a8" full-width strip. Green is half the canvas height. */
 function wmMark(kind: str): str {
     line half: str = global "px.hex"[wmCanvasH() / 2 + 1] as str;
     return "<font:wl:p15><c:#fa%var(half)%var(kind)>";
@@ -79,7 +120,11 @@ function wmStart {
     pxInit();
     wmStop();
     global "s.player" = default.uuid;
-    game.spawnInteractionEntity(default.location, 0.8, 0.6);
+    // The seat sits at block fraction 0.123 in x and 0.456 in z: shaders read
+    // the camera's fraction as the desktop flag (wl:desktop.glsl) and hide
+    // the hand and hotbar.
+    line here: loc = default.location;
+    game.spawnInteractionEntity(loc(num.floor(here.x) + 0.123, here.y, num.floor(here.z) + 0.456, 0, 0), 0.8, 0.6);
     line seat: str = lastEntity.uuid;
     default.rideEntity(seat);
     default.setRotation(0, 0);
@@ -103,9 +148,19 @@ function wmStart {
     global "s.windows" = list.create() as list[str];
     global "s.conns" = list.create() as list[num];
     global "s.placed" = 0;
+    global "s.panels" = list.create() as list[str];
+    global "s.shells" = list.create() as list[str];
+    global "s.handle" = 0;
+    global "s.handles" = {};
+    global "s.shellDirty" = 0;
+    global "s.shellSent" = list.create() as list[num];
+    if (!var.exists(global "shell.bg")) {
+        global "shell.bg" = 0x000000;
+    }
     global "k.listen" = list.create() as list[num];
     global "k.closed" = list.create() as list[num];
     start wlServer;
+    start appShell;
 }
 
 /** Stops the compositor and every client, removes every window and the cursor, and lets the player off the seat. */
@@ -120,6 +175,14 @@ function wmStop {
         }
     }
     global "s.windows" = list.create() as list[str];
+    if (var.exists(global "s.panels")) {
+        line panels: list[str] = global "s.panels";
+        for (line key of panels) {
+            line pp: list = (key as str).split(":");
+            wmRemoveDisplays(num.parse(pp[1] as str), num.parse(pp[2] as str));
+        }
+    }
+    global "s.panels" = list.create() as list[str];
     if (var.exists(global "s.desk")) {
         line desk: dict = global "s.desk";
         line ents: list[str] = desk["outline"] as list[str];
@@ -206,16 +269,28 @@ function wmShow(c: num, id: num, damage: list) {
     line format: num = b["format"] as num;
     line st: dict = global "s.o %var(c) %var(id)";
     line key: str = "%var(c):%var(id)";
+    line panel: num = 0;
+    if (st["role"] as str == "panel") {
+        panel = 1;
+    }
     line fresh: num = 0;
     if (st["mapped"] as num == 0 || st["w"] as num != w || st["h"] as num != h || st["format"] as num != format) {
         if (st["mapped"] as num == 1) {
             wmRemoveDisplays(c, id);
+        } else if (panel == 1) {
+            global "s.panels".append(key);
         } else {
             // A new window: cascade it down from upper left of centre and give it focus.
             st["wx"] = -240 + (global "s.placed" * 40) % 240;
             st["wy"] = -140 + (global "s.placed" * 30) % 150;
             global "s.placed" += 1;
             global "s.windows".append(key);
+            global "s.handle" += 1;
+            line handle: num = global "s.handle";
+            st["handle"] = handle;
+            st["min"] = 0;
+            global "s.handles"["%var(handle)"] = key;
+            global "s.shellDirty" = 1;
         }
         st["mapped"] = 1;
         st["w"] = w;
@@ -226,6 +301,10 @@ function wmShow(c: num, id: num, damage: list) {
         // client re-processes each glyph sent (README, Data path benchmarks).
         st["bandRows"] = num.max(1, num.min(num.floor(1024 / w), num.floor(9980 / (w + 1))));
         st["bands"] = num.round(h / (st["bandRows"] as num), mode="Ceiling");
+        if (panel == 1 && st["panel"] as num == 0) {
+            // The background is all fill (wmFillText).
+            st["bands"] = 0;
+        }
         global "s.o %var(c) %var(id)" = st;
         wmCreateDisplays(c, id);
         fresh = 1;
@@ -256,7 +335,10 @@ function wmShow(c: num, id: num, damage: list) {
     }
     wlsPut(c, id, "dirty", dirty);
     wlsPut(c, id, "present", 1);
-    if (fresh == 1) {
+    if (panel == 1 && st["panel"] as num <= 1) {
+        wmSetText(wlsGet(c, id, "fill") as str, wmFillText(c, id));
+    }
+    if (fresh == 1 && panel == 0) {
         wmFocus(key);
     }
 }
@@ -271,10 +353,21 @@ function wmCreateDisplays(c: num, id: num) {
         wmSetupDisplay(w * 2 + 10, st["bandRows"] as num);
         uuids.append(lastEntity.uuid);
     }
+    wlsPut(c, id, "displays", uuids);
+    if (st["role"] as str == "panel") {
+        wlsPut(c, id, "decoDirty", 0);
+        if (st["panel"] as num <= 1) {
+            // The background, and the taskbar's ends on wide windows: a full-width strip.
+            game.spawnTextDisplay(global "s.desk"["eye"] as loc, s" ");
+            wmSetupDisplay(20, wmCanvasH());
+            wlsPut(c, id, "fill", lastEntity.uuid);
+        }
+        wmPlace(c, id);
+        return;
+    }
     game.spawnTextDisplay(global "s.desk"["eye"] as loc, s" ");
     wmSetupDisplay(w * 2 + 10, wmDecoH());
     wlsPut(c, id, "deco", lastEntity.uuid);
-    wlsPut(c, id, "displays", uuids);
     wlsPut(c, id, "grip", wmSprite(wmGripText(), "a6", 0, 0, 0));
     // The title bar is a small p15 image the compositor draws itself.
     wlsPut(c, id, "decoFd", p15Create(w, wmDecoH(), p15Color(0)));
@@ -303,14 +396,41 @@ function wmGripText(): str {
     return rows.join("\n");
 }
 
-/** Moves window id's displays to its canvas position and stacking depth. */
+/**
+ * Where surface id's buffer goes: [x, y, sx, sy, z], its top-left in canvas
+ * pixels, each buffer pixel covering sx x sy, at stacking depth z.
+ * Windows sit where they were put (far off the canvas while minimized);
+ * panels where their role says. The background covers the whole canvas.
+ */
+function wmBox(c: num, id: num): list[num] {
+    line st: dict = global "s.o %var(c) %var(id)";
+    line w: num = st["w"] as num;
+    line h: num = st["h"] as num;
+    if (st["role"] as str == "panel") {
+        line role: num = st["panel"] as num;
+        if (role == 0) {
+            return [0 - wmCanvasW() / 2, 0 - wmCanvasH() / 2, wmCanvasW() / w, wmCanvasH() / h, wmPanelZ(0)];
+        } else if (role == 1) {
+            return [0 - wmCanvasW() / 2, wmCanvasH() / 2 - h, 1, 1, wmPanelZ(1)];
+        }
+        return [0 - wmCanvasW() / 2, wmCanvasH() / 2 - wmTaskbarH() - h, 1, 1, wmPanelZ(2)];
+    }
+    // Each step up the stack is nearer the camera (text.vsh: z 0 to 0.1).
+    line z: num = num.min(global "s.windows".find("%var(c):%var(id)") * 0.003, wmTopZ());
+    line x: num = st["wx"] as num;
+    if (st["min"] as num == 1) {
+        x += 20000;
+    }
+    return [x, st["wy"] as num, 1, 1, z];
+}
+
+/** Moves surface id's displays to its canvas position and stacking depth. */
 function wmPlace(c: num, id: num) {
     line st: dict = global "s.o %var(c) %var(id)";
-    line key: str = "%var(c):%var(id)";
-    // Each step up the stack is nearer the camera (text.vsh: z 0 to 0.1).
-    line z: num = global "s.windows".find(key) * 0.003;
-    line wx: num = st["wx"] as num;
-    line wy: num = st["wy"] as num;
+    line box: list[num] = wmBox(c, id);
+    line wx: num = box[1] as num;
+    line wy: num = box[2] as num;
+    line z: num = box[5] as num;
     line w: num = st["w"] as num;
     line h: num = st["h"] as num;
     line bandRows: num = st["bandRows"] as num;
@@ -318,6 +438,17 @@ function wmPlace(c: num, id: num) {
     repeat (line b to uuids.len()) {
         line top: num = (b - 1) * bandRows;
         wmMove(uuids[b] as str, wmAt(wx, wy + top, w, num.min(bandRows, h - top), z));
+    }
+    if (st["role"] as str == "panel") {
+        if (st.hasKey("fill")) {
+            // Centred on x = 0 (text.vsh stretches it), just under the panel.
+            line rows: num = h;
+            if (st["panel"] as num == 0) {
+                rows = wmCanvasH();
+            }
+            wmMove(st["fill"] as str, wmAt(-2, wy, 4, rows, num.max(0, z - 0.002)));
+        }
+        return;
     }
     wmMove(st["deco"] as str, wmAt(wx, wy - wmDecoH(), w, wmDecoH(), z));
     wmMove(st["grip"] as str, wmAt(wx + w - wmGrip(), wy + h - wmGrip(), wmGrip(), wmGrip(), z + 0.001));
@@ -342,13 +473,24 @@ function wmRemoveDisplays(c: num, id: num) {
         return;
     }
     line ents: list[str] = st["displays"] as list[str];
-    ents.append(st["deco"] as str, st["grip"] as str);
+    line panel: num = 0;
+    if (st["role"] as str == "panel") {
+        panel = 1;
+        if (st.hasKey("fill")) {
+            ents.append(st["fill"] as str);
+            st.remove("fill");
+        }
+    } else {
+        ents.append(st["deco"] as str, st["grip"] as str);
+    }
     for (line uid of ents) {
         select entitiesByUUID(uid as str);
         selectedEntity.remove();
         select reset;
     }
-    kMemFree(st["decoFd"] as num);
+    if (panel == 0) {
+        kMemFree(st["decoFd"] as num);
+    }
     st.remove("displays");
     global "s.o %var(c) %var(id)" = st;
 }
@@ -362,7 +504,17 @@ function wmUnmap(c: num, id: num) {
     wlsPut(c, id, "mapped", 0);
     wlsPut(c, id, "dirty", list.create());
     line key: str = "%var(c):%var(id)";
+    if (wlsGet(c, id, "role") as str == "panel") {
+        global "s.panels".removeValue(key);
+        if (global "s.ptr"["over"] as str == key) {
+            global "s.ptr"["over"] = "";
+        }
+        return;
+    }
     global "s.windows".removeValue(key);
+    line handle: num = wlsGet(c, id, "handle") as num;
+    global "s.handles".remove("%var(handle)");
+    global "s.shellDirty" = 1;
     if (global "s.ptr"["over"] as str == key) {
         global "s.ptr"["over"] = "";
     }
@@ -375,11 +527,142 @@ function wmUnmap(c: num, id: num) {
     if (global "s.focus" == key) {
         global "s.focus" = "";
         // Focus falls to the window below, if any.
-        if (global "s.windows".len() > 0) {
-            wmFocus(global "s.windows"[global "s.windows".len()] as str);
-        }
+        wmFocus(wmTopShown());
     }
     wmPlaceAll();
+}
+
+/**
+ * The full-width strip (kind a8) under a background or taskbar panel: 4
+ * glyphs a row, which text.vsh stretches across the window. The background
+ * is its buffer's top-left pixel on every canvas row; the taskbar's ends are
+ * the last pixel of each of its rows.
+ */
+function wmFillText(c: num, id: num): str {
+    line buf: num = wlsGet(c, id, "buf") as num;
+    line b: dict = global "s.o %var(c) %var(buf)" as dict;
+    line fd: num = b["fd"] as num;
+    line first: num = (b["offset"] as num) + 1;
+    line w: num = b["width"] as num;
+    line h: num = b["height"] as num;
+    if (wlsGet(c, id, "panel") as num == 0) {
+        line g: str = (global "k.mem %var(fd)"[first] as str).trim(1, 1).repeat(4);
+        return wmMark("a8") + g + ("\n" + g).repeat(wmCanvasH() - 1);
+    }
+    line rows: list[str] = list.create() as list[str];
+    repeat (line r to h) {
+        rows.append((global "k.mem %var(fd)"[first + r - 1] as str).trim(w, w).repeat(4));
+    }
+    return wmMark("a8") + rows.join("\n");
+}
+
+/** The topmost window that is not minimized, or "". */
+function wmTopShown(): str {
+    line windows: list[str] = global "s.windows";
+    line i: num = windows.len();
+    while (i >= 1) {
+        line key: str = windows[i] as str;
+        line p: list = key.split(":");
+        if (wlsGet(num.parse(p[1] as str), num.parse(p[2] as str), "min") as num == 0) {
+            return key;
+        }
+        i -= 1;
+    }
+    return "";
+}
+
+/** The window key with shell handle `handle`, or "". */
+function wmHandleKey(handle: num): str {
+    if (global "s.handles".hasKey("%var(handle)")) {
+        return global "s.handles"["%var(handle)"] as str;
+    }
+    return "";
+}
+
+/** Restores window key if minimized, raises it and gives it focus (taskbar and menu clicks). */
+function wmActivate(key: str) {
+    line p: list = key.split(":");
+    line c: num = num.parse(p[1] as str);
+    line id: num = num.parse(p[2] as str);
+    if (wlsGet(c, id, "min") as num == 1) {
+        wlsPut(c, id, "min", 0);
+        wmPlace(c, id);
+    }
+    wmFocus(key);
+    global "s.shellDirty" = 1;
+}
+
+/** Minimizes window key: it leaves the canvas and focus falls to the topmost window still shown. */
+function wmMinimize(key: str) {
+    line p: list = key.split(":");
+    line c: num = num.parse(p[1] as str);
+    line id: num = num.parse(p[2] as str);
+    if (wlsGet(c, id, "min") as num == 1) {
+        return;
+    }
+    wlsPut(c, id, "min", 1);
+    wmPlace(c, id);
+    if (global "s.ptr"["over"] as str == key) {
+        global "s.ptr"["over"] = "";
+    }
+    if (global "s.focus" == key) {
+        wmFocus(wmTopShown());
+    }
+    global "s.shellDirty" = 1;
+}
+
+/** The shell state of window key: 1 focused, plus 2 minimized. */
+function wmShellState(key: str): num {
+    line p: list = key.split(":");
+    line state: num = 2 * (wlsGet(num.parse(p[1] as str), num.parse(p[2] as str), "min") as num);
+    if (global "s.focus" == key) {
+        state += 1;
+    }
+    return state;
+}
+
+/** Tells df_shell binding id of c about every window, then done. */
+function wmShellSend(c: num, id: num) {
+    line windows: list[str] = global "s.windows";
+    for (line key of windows) {
+        line p: list = (key as str).split(":");
+        line wc: num = num.parse(p[1] as str);
+        line wid: num = num.parse(p[2] as str);
+        line st: dict = global "s.o %var(wc) %var(wid)" as dict;
+        line title: str = st["title"] as str;
+        if (title == "") {
+            title = st["appId"] as str;
+        }
+        wlsSend(c, id, "df_shell", "window", [st["handle"], title, wmShellState(key as str)]);
+    }
+    wlsSend(c, id, "df_shell", "done", list.create());
+}
+
+/** Once a tick: if the windows changed, tells every shell binding about them and about the windows that closed. */
+function wmShellSync {
+    if (global "s.shellDirty" == 0) {
+        return;
+    }
+    global "s.shellDirty" = 0;
+    line now: list[num] = list.create() as list[num];
+    for (line key of global "s.windows") {
+        line p: list = (key as str).split(":");
+        now.append(wlsGet(num.parse(p[1] as str), num.parse(p[2] as str), "handle") as num);
+    }
+    line sent: list[num] = global "s.shellSent";
+    global "s.shellSent" = now;
+    line shells: list[str] = global "s.shells";
+    for (line sk of shells) {
+        line sp: list = (sk as str).split(":");
+        line c: num = num.parse(sp[1] as str);
+        line id: num = num.parse(sp[2] as str);
+        for (line h of sent) {
+            if (now.find(h as num) == 0) {
+                wlsSend(c, id, "df_shell", "window_closed", [h]);
+            }
+        }
+        wmShellSend(c, id);
+    }
 }
 
 /** Draws window id's title bar: its title, and a close box on the right. Focused bars are blue. */
@@ -413,6 +696,7 @@ function wmDrawDeco(c: num, id: num) {
 function wmTitleChanged(c: num, id: num) {
     if (wlsGet(c, id, "mapped") as num == 1) {
         wmDrawDeco(c, id);
+        global "s.shellDirty" = 1;
     }
 }
 
@@ -428,6 +712,7 @@ function wmFocus(key: str) {
         return;
     }
     global "s.focus" = key;
+    global "s.shellDirty" = 1;
     if (old != "") {
         line op: list = old.split(":");
         line oc: num = num.parse(op[1] as str);
@@ -491,11 +776,50 @@ function wmCursor(): list[num] {
     return [x, y];
 }
 
+/** The mapped panel with role `role`, or "". */
+function wmPanelKey(role: num): str {
+    for (line key of global "s.panels") {
+        line p: list = (key as str).split(":");
+        if (wlsGet(num.parse(p[1] as str), num.parse(p[2] as str), "panel") as num == role) {
+            return key as str;
+        }
+    }
+    return "";
+}
+
+/** [panel key, "panel", surface x, surface y] if canvas (x, y) is on the panel with role `role`, else []. */
+function wmHitPanel(role: num, x: num, y: num): list {
+    line key: str = wmPanelKey(role);
+    if (key == "") {
+        return list.create();
+    }
+    line p: list = key.split(":");
+    line c: num = num.parse(p[1] as str);
+    line id: num = num.parse(p[2] as str);
+    line box: list[num] = wmBox(c, id);
+    line bx: num = box[1] as num;
+    line by: num = box[2] as num;
+    line bw: num = (wlsGet(c, id, "w") as num) * (box[3] as num);
+    line bh: num = (wlsGet(c, id, "h") as num) * (box[4] as num);
+    if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+        return [key, "panel", num.floor((x - bx) / (box[3] as num)), num.floor((y - by) / (box[4] as num))];
+    }
+    return list.create();
+}
+
 /**
- * What canvas point (x, y) is on, topmost first: [window key, part, surface x, surface y].
- * part is "body", "grip", "title" or "close"; the key is "" over the empty desktop.
+ * What canvas point (x, y) is on, topmost first: [surface key, part, surface x, surface y].
+ * part is "panel" (the menu, the taskbar, or under every window the
+ * background) or a window's "body", "grip", "title" or "close"; the key is
+ * "" when nothing is there.
  */
 function wmHit(x: num, y: num): list {
+    for (line role of [2, 1]) {
+        line ph: list = wmHitPanel(role as num, x, y);
+        if (ph.len() > 0) {
+            return ph;
+        }
+    }
     line windows: list[str] = global "s.windows";
     line i: num = windows.len();
     while (i >= 1) {
@@ -504,6 +828,11 @@ function wmHit(x: num, y: num): list {
         line hc: num = num.parse(p[1] as str);
         line hid: num = num.parse(p[2] as str);
         line st: dict = global "s.o %var(hc) %var(hid)" as dict;
+        if (st["min"] as num == 1) {
+            // Minimized: off the canvas.
+            i -= 1;
+            continue;
+        }
         line wx: num = st["wx"] as num;
         line wy: num = st["wy"] as num;
         line w: num = st["w"] as num;
@@ -521,6 +850,10 @@ function wmHit(x: num, y: num): list {
             return [key, "title", x - wx, y - wy];
         }
         i -= 1;
+    }
+    line bh: list = wmHitPanel(0, x, y);
+    if (bh.len() > 0) {
+        return bh;
     }
     return ["", "", 0, 0];
 }
@@ -569,7 +902,7 @@ function wmInput {
     }
     line hit: list = wmHit(x, y);
     line over: str = "";
-    if (hit[2] as str == "body") {
+    if (hit[2] as str == "body" || hit[2] as str == "panel") {
         over = hit[1] as str;
     }
     line old: str = global "s.ptr"["over"] as str;
@@ -619,8 +952,11 @@ function wmClick(button: num, hit: list) {
     if (key == "") {
         return;
     }
-    wmFocus(key);
     line part: str = hit[2] as str;
+    if (part != "panel") {
+        // Panels never take keyboard focus.
+        wmFocus(key);
+    }
     line p: list = key.split(":");
     line c: num = num.parse(p[1] as str);
     line id: num = num.parse(p[2] as str);
